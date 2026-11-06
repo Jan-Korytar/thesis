@@ -3,30 +3,33 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 
 class OptionDataset(Dataset):
-    def __init__(self, x: torch.Tensor, y: torch.Tensor) -> None:
+    def __init__(self, x: torch.Tensor, y: torch.Tensor, w: torch.Tensor | None = None) -> None:
         assert x.ndim == 2
         assert y.ndim == 2
         assert x.shape[0] == y.shape[0]
         self.x = x.float()
         self.y = y.float()
+        self.w = w.float() if w is not None else torch.ones((x.shape[0], 1), dtype=torch.float32)
+        assert self.w.shape == (x.shape[0], 1)
 
     def __len__(self) -> int:
         return self.x.shape[0]
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.x[idx], self.y[idx]
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.x[idx], self.y[idx], self.w[idx]
 
 
 def create_dataloader(
     x: torch.Tensor,
     y: torch.Tensor,
-    batch_size: int,
-    shuffle: bool,
+    w: torch.Tensor | None = None,
+    batch_size: int = 256,
+    shuffle: bool = True,
     num_workers: int = 0,
 ) -> DataLoader:
     assert batch_size > 0
     assert num_workers >= 0
-    dataset = OptionDataset(x, y)
+    dataset = OptionDataset(x, y, w)
     return DataLoader(
         dataset,
         batch_size=batch_size,

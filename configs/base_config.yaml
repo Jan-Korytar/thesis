@@ -1,12 +1,13 @@
-experiment_name: "bates_kou_surrogate"
+experiment_name: "bates_kou_phase2_bsiv_surrogate"
 seed: 42
 device: "cuda"
 model_config: "configs/model/mlp.yaml"
 mode: "active"
+target_type: "bsiv"
 
 data:
   bounds:
-    moneyness: [-9.00, 5.000]
+    moneyness: [-0.60, 0.60]
     maturity_days: [1.00, 365.000]
     spot_var: [0.01, 0.900]
     risk_free_rate: [0.00, 0.075]
@@ -24,8 +25,13 @@ training:
   batch_size: 256
   num_workers: 0
   learning_rate: 0.001
+  min_learning_rate: 1.0e-5
+  lr_patience: 2
+  lr_factor: 0.5
   weight_decay: 1.0e-5
-  loss_fn: "l1"
+  loss_fn: "bsiv"
+  use_vega_loss: false
+  use_amp: true
 
 passive:
   n_samples: 50000
@@ -33,10 +39,13 @@ passive:
   epochs: 50
 
 active:
-  initial_samples: 2000
-  rounds: 20
-  query_size: 1000
-  pool_size: 20000
+  initial_samples: 100_000
+  rounds: 100
+  query_size: 5_000
+  pool_size: 50_000
   mc_passes: 20
-  val_samples: 10_000
+  val_samples: 100_000
   epochs_per_round: 25
+  target_val_loss: 0.005
+  early_stopping_patience: 5
+  curvature_weight: 1.5

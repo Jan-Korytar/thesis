@@ -49,12 +49,24 @@ def load_config(path: str | Path) -> dict[str, Any]:
         cfg["training"]["batch_size"] = cfg["data"]["batch_size"]
     if "num_workers" not in cfg["training"] and "num_workers" in cfg["data"]:
         cfg["training"]["num_workers"] = cfg["data"]["num_workers"]
+    if "use_vega_loss" not in cfg["training"]:
+        cfg["training"]["use_vega_loss"] = True
+    if "use_amp" not in cfg["training"]:
+        cfg["training"]["use_amp"] = True
+    if "min_learning_rate" not in cfg["training"]:
+        cfg["training"]["min_learning_rate"] = 1.0e-5
+    if "lr_patience" not in cfg["training"]:
+        cfg["training"]["lr_patience"] = 2
+    if "lr_factor" not in cfg["training"]:
+        cfg["training"]["lr_factor"] = 0.5
 
     assert "batch_size" in cfg["training"]
     assert "num_workers" in cfg["training"]
 
     if "mode" not in cfg:
-        cfg["mode"] = "passive"
+        cfg["mode"] = "active"
+    if "target_type" not in cfg:
+        cfg["target_type"] = "price"
 
     mode = cfg["mode"]
     assert mode in ("active", "passive")
@@ -69,6 +81,13 @@ def load_config(path: str | Path) -> dict[str, Any]:
         assert "mc_passes" in active_cfg
         assert "val_samples" in active_cfg
         assert "epochs_per_round" in active_cfg
+
+        if "target_val_loss" not in active_cfg:
+            active_cfg["target_val_loss"] = 0.001
+        if "early_stopping_patience" not in active_cfg:
+            active_cfg["early_stopping_patience"] = 5
+        if "curvature_weight" not in active_cfg:
+            active_cfg["curvature_weight"] = 1.0
     else:
         if "passive" not in cfg:
             cfg["passive"] = {

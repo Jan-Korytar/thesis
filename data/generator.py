@@ -85,6 +85,50 @@ def price_bates_call(x: torch.Tensor, n_quad: int = 128) -> torch.Tensor:
     return torch.clamp(c_norm, min=lower_bound, max=upper_bound).float()
 
 
+def bs_call_price(m: torch.Tensor, tau: torch.Tensor, r: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    k = torch.exp(-m)
+    sqrt_tau = torch.sqrt(tau)
+    d1 = (m + (r - q + 0.5 * sigma**2) * tau) / (sigma * sqrt_tau)
+    d2 = d1 - sigma * sqrt_tau
+
+    c1 = 0.5 * (1.0 + torch.erf(d1 / np.sqrt(2.0)))
+    c2 = 0.5 * (1.0 + torch.erf(d2 / np.sqrt(2.0)))
+    return torch.exp(-q * tau) * c1 - k * torch.exp(-r * tau) * c2
+
+
+def invert_bsiv(
+    price: torch.Tensor,
+    m: torch.Tensor,
+    tau: torch.Tensor,
+    r: torch.Tensor,
+    q: torch.Tensor,
+    max_iter: int = 25,
+    tol: float = 1e-5,
+) -> torch.Tensor:
+    k = torch.exp(-m)
+    lower = torch.clamp(torch.exp(-q * tau) - k * torch.exp(-r * tau), min=0.0)
+    upper = torch.exp(-q * tau)
+    valid = (price > lower + 1e-5) & (price < upper - 1e-5)
+
+    sigma = torch.clamp(torch.sqrt(2.0 * np.pi / tau) * price, min=0.05, max=2.0)
+    for _ in range(max_iter):
+        p_guess = bs_call_price(m, tau, r, q, sigma)
+        diff = p_guess - price
+
+        sqrt_tau = torch.sqrt(tau)
+        d1 = (m + (r - q + 0.5 * sigma**2) * tau) / (sigma * sqrt_tau)
+        vega = torch.exp(-q * tau) * sqrt_tau * (1.0 / np.sqrt(2.0 * np.pi)) * torch.exp(-0.5 * d1**2)
+        vega = torch.clamp(vega, min=1e-8)
+
+        step = diff / vega
+        sigma = torch.clamp(sigma - step, min=0.001, max=5.0)
+        if torch.max(torch.abs(diff[valid])) < tol:
+            break
+
+    sigma[~valid] = float("nan")
+    return sigma
+
+
 def sample_parameters(bounds: dict[str, list[float]], n_samples: int, seed: int | None = None) -> torch.Tensor:
     assert n_samples > 0
     generator = torch.Generator().manual_seed(seed) if seed is not None else None
@@ -121,3 +165,43 @@ def generate_bates_data(
     assert not torch.isnan(y).any()
     assert y.shape == (n_samples, 1)
     return x, y
+
+
+def generate_bates_bsiv_data(
+    bounds: dict[str, list[float]],
+    n_samples: int,
+    seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    collected_x: list[torch.Tensor] = []
+    collected_y: list[torch.Tensor] = []
+    collected_count = 0
+    cur_seed = seed
+
+    while collected_count < n_samples:
+        needed = n_samples - collected_count
+        batch_n = max(needed * 2, 1000)
+        x_cand = sample_parameters(bounds, batch_n, cur_seed)
+        if cur_seed is not None:
+            cur_seed += 1000
+
+        prices = price_bates_call(x_cand)
+        m = x_cand[:, 0]
+        tau = x_cand[:, 1] / 365.0
+        r = x_cand[:, 3]
+        q = x_cand[:, 4]
+
+        bsiv = invert_bsiv(prices, m, tau, r, q)
+        valid = torch.isfinite(bsiv) & (bsiv > 0.01) & (bsiv < 4.0)
+
+        x_val = x_cand[valid]
+        y_val = bsiv[valid].unsqueeze(1)
+
+        collected_x.append(x_val)
+        collected_y.append(y_val)
+        collected_count += len(x_val)
+
+    x_all = torch.cat(collected_x, dim=0)[:n_samples]
+    y_all = torch.cat(collected_y, dim=0)[:n_samples]
+    assert x_all.shape == (n_samples, 13)
+    assert y_all.shape == (n_samples, 1)
+    return x_all, y_all

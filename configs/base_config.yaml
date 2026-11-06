@@ -1,0 +1,42 @@
+experiment_name: "bates_kou_surrogate"
+seed: 42
+device: "cuda"
+model_config: "configs/model/mlp.yaml"
+mode: "active"
+
+data:
+  bounds:
+    moneyness: [-9.00, 5.000]
+    maturity_days: [1.00, 365.000]
+    spot_var: [0.01, 0.900]
+    risk_free_rate: [0.00, 0.075]
+    dividend_yield: [0.00, 0.050]
+    kappa: [0.10, 50.000]
+    long_run_var: [0.01, 0.900]
+    sigma: [0.10, 5.000]
+    rho: [-1.00, 0.000]
+    jump_intensity: [0.00, 4.000]
+    nu_u: [0.00, 0.400]
+    nu_d: [0.00, 0.400]
+    p_up: [0.00, 1.000]
+
+training:
+  batch_size: 256
+  num_workers: 0
+  learning_rate: 0.001
+  weight_decay: 1.0e-5
+  loss_fn: "l1"
+
+passive:
+  n_samples: 50000
+  train_split: 0.8
+  epochs: 50
+
+active:
+  initial_samples: 2000
+  rounds: 20
+  query_size: 1000
+  pool_size: 20000
+  mc_passes: 20
+  val_samples: 10_000
+  epochs_per_round: 25

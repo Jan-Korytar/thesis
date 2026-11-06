@@ -1,0 +1,6 @@
+model_name: "surrogate_mlp"
+input_dim: 13
+hidden_layers: [256, 256, 256]
+activation: "silu"
+dropout_rate: 0.05
+output_dim: 1

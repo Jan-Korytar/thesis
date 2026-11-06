@@ -1,0 +1,72 @@
+import torch
+from torch.utils.data import DataLoader, Dataset, random_split
+
+
+class OptionDataset(Dataset):
+    def __init__(self, x: torch.Tensor, y: torch.Tensor) -> None:
+        assert x.ndim == 2
+        assert y.ndim == 2
+        assert x.shape[0] == y.shape[0]
+        self.x = x.float()
+        self.y = y.float()
+
+    def __len__(self) -> int:
+        return self.x.shape[0]
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.x[idx], self.y[idx]
+
+
+def create_dataloader(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int = 0,
+) -> DataLoader:
+    assert batch_size > 0
+    assert num_workers >= 0
+    dataset = OptionDataset(x, y)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+    )
+
+
+def build_dataloaders(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    train_split: float,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+) -> tuple[DataLoader, DataLoader]:
+    assert 0.0 < train_split < 1.0
+    assert batch_size > 0
+    assert num_workers >= 0
+
+    dataset = OptionDataset(x, y)
+    n_total = len(dataset)
+    n_train = int(n_total * train_split)
+    n_val = n_total - n_train
+    assert n_train > 0
+    assert n_val > 0
+
+    generator = torch.Generator().manual_seed(seed)
+    train_set, val_set = random_split(dataset, [n_train, n_val], generator=generator)
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+    return train_loader, val_loader

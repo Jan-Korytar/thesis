@@ -257,6 +257,7 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
         "bsiv": BSIVLoss(),
     }
     criterion = loss_map[cfg["training"]["loss_fn"].lower()]
+    optimizer = build_optimizer(model, cfg["training"]["learning_rate"], cfg["training"]["weight_decay"], device)
     total_epochs = (rounds + 1) * epochs_per_round
     scheduler = build_warm_restart_cosine_scheduler(
         optimizer=optimizer,

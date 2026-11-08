@@ -5,7 +5,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-from data.dataset import build_dataloaders, create_dataloader
+from data.dataset import TensorBatchLoader, build_dataloaders, create_dataloader
 from data.generator import (
     generate_bates_bsiv_data,
     generate_bates_data,
@@ -45,7 +45,7 @@ def compute_vega_weights(x_raw: torch.Tensor, eps: float = 0.01, max_weight: flo
     return torch.clamp(norm_weights, min=0.1, max=max_weight).unsqueeze(1).float()
 
 
-def compute_pool_curvature(model: nn.Module, x_norm: torch.Tensor, batch_size: int = 2048) -> torch.Tensor:
+def compute_pool_curvature(model: nn.Module, x_norm: torch.Tensor, batch_size: int = 8192) -> torch.Tensor:
     curvatures = []
     model.eval()
     for i in range(0, len(x_norm), batch_size):
@@ -54,17 +54,20 @@ def compute_pool_curvature(model: nn.Module, x_norm: torch.Tensor, batch_size: i
         grad1 = torch.autograd.grad(pred.sum(), bx, create_graph=True)[0][:, 0]
         grad2 = torch.autograd.grad(grad1.sum(), bx, create_graph=False)[0][:, 0]
         curvatures.append(torch.abs(grad2).detach())
-        del bx, pred, grad1, grad2
-
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
     return torch.cat(curvatures, dim=0)
+
+
+def resolve_device(device_str: str) -> torch.device:
+    return torch.device(device_str if torch.cuda.is_available() and device_str.startswith("cuda") else "cpu")
+
+
+def build_optimizer(model: nn.Module, lr: float, weight_decay: float, device: torch.device) -> torch.optim.Optimizer:
+    return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, fused=device.type == "cuda")
 
 
 def run_epoch(
     model: nn.Module,
-    loader: torch.utils.data.DataLoader,
+    loader: TensorBatchLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
@@ -75,25 +78,20 @@ def run_epoch(
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
-    total_loss = 0.0
+    total_loss = torch.zeros((), device=device)
     total_samples = 0
-    device_type = "cuda" if device.type == "cuda" else "cpu"
 
     with torch.set_grad_enabled(is_train):
         for bx, by, bw in loader:
-            bx = bx.to(device, non_blocking=True)
-            by = by.to(device, non_blocking=True)
-            bw = bw.to(device, non_blocking=True)
-
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast(device_type=device_type, enabled=use_amp):
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 pred = model(bx)
                 if is_train and use_weights:
-                    loss = torch.mean(bw * torch.abs(pred - by))
+                    loss = torch.mean(bw * torch.abs(pred.float() - by))
                 else:
-                    loss = criterion(pred, by)
+                    loss = criterion(pred.float(), by)
 
             if is_train:
                 if scaler is not None and use_amp:
@@ -104,12 +102,11 @@ def run_epoch(
                     loss.backward()
                     optimizer.step()
 
-            batch_size = len(bx)
-            total_loss += loss.item() * batch_size
-            total_samples += batch_size
+            total_loss += loss.detach() * len(bx)
+            total_samples += len(bx)
 
     assert total_samples > 0
-    return total_loss / total_samples
+    return total_loss.item() / total_samples
 
 
 def get_val_bounds(bounds: dict[str, list[float]]) -> dict[str, list[float]]:
@@ -133,8 +130,7 @@ def save_checkpoint(model: nn.Module, cfg: dict[str, Any], val_loss: float, path
 
 def train_passive(cfg: dict[str, Any]) -> nn.Module:
     set_seed(cfg["seed"])
-    device_str = cfg["device"]
-    device = torch.device(device_str if torch.cuda.is_available() and device_str == "cuda" else "cpu")
+    device = resolve_device(cfg["device"])
 
     use_amp = cfg["training"]["use_amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -143,20 +139,19 @@ def train_passive(cfg: dict[str, Any]) -> nn.Module:
     passive_cfg = cfg["passive"]
     bounds = cfg["data"]["bounds"]
     if is_bsiv:
-        x, y = generate_bates_bsiv_data(bounds, passive_cfg["n_samples"], seed=cfg["seed"])
+        x, y = generate_bates_bsiv_data(bounds, passive_cfg["n_samples"], seed=cfg["seed"], device=device)
     else:
-        x, y = generate_bates_data(bounds, passive_cfg["n_samples"], seed=cfg["seed"])
+        x, y = generate_bates_data(bounds, passive_cfg["n_samples"], seed=cfg["seed"], device=device)
     x_norm = normalize_features(x, bounds)
 
-    pin_memory = cfg["training"].get("pin_memory", True)
     train_loader, val_loader = build_dataloaders(
         x=x_norm,
         y=y,
         train_split=passive_cfg["train_split"],
         batch_size=cfg["training"]["batch_size"],
-        num_workers=cfg["training"]["num_workers"],
+        eval_batch_size=cfg["training"]["eval_batch_size"],
         seed=cfg["seed"],
-        pin_memory=pin_memory,
+        device=device,
     )
 
     model = build_model(cfg).to(device)
@@ -167,11 +162,7 @@ def train_passive(cfg: dict[str, Any]) -> nn.Module:
         "bsiv": BSIVLoss(),
     }
     criterion = loss_map[cfg["training"]["loss_fn"].lower()]
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg["training"]["learning_rate"],
-        weight_decay=cfg["training"]["weight_decay"],
-    )
+    optimizer = build_optimizer(model, cfg["training"]["learning_rate"], cfg["training"]["weight_decay"], device)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -199,8 +190,7 @@ def train_passive(cfg: dict[str, Any]) -> nn.Module:
 
 def train_active(cfg: dict[str, Any]) -> nn.Module:
     set_seed(cfg["seed"])
-    device_str = cfg["device"]
-    device = torch.device(device_str if torch.cuda.is_available() and device_str == "cuda" else "cpu")
+    device = resolve_device(cfg["device"])
 
     use_amp = cfg["training"]["use_amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -210,8 +200,7 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
     bounds = cfg["data"]["bounds"]
     val_bounds = get_val_bounds(bounds)
     batch_size = cfg["training"]["batch_size"]
-    num_workers = cfg["training"]["num_workers"]
-    pin_memory = cfg["training"].get("pin_memory", True)
+    eval_batch_size = cfg["training"]["eval_batch_size"]
     use_vega_loss = cfg["training"]["use_vega_loss"] and not is_bsiv
 
     if is_bsiv:
@@ -222,15 +211,11 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
         x_train_raw, y_train = generate_bates_data(bounds, active_cfg["initial_samples"], seed=cfg["seed"], device=device)
 
     x_val_norm = normalize_features(x_val_raw, bounds)
-    val_loader = create_dataloader(
-        x_val_norm, y_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory
-    )
+    val_loader = create_dataloader(x_val_norm, y_val, batch_size=eval_batch_size, shuffle=False, device=device)
 
     w_train = compute_vega_weights(x_train_raw) if use_vega_loss else None
     x_train_norm = normalize_features(x_train_raw, bounds)
-    train_loader = create_dataloader(
-        x_train_norm, y_train, w_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
-    )
+    train_loader = create_dataloader(x_train_norm, y_train, w_train, batch_size=batch_size, shuffle=True, device=device)
 
     model = build_model(cfg).to(device)
     loss_map = {
@@ -240,11 +225,7 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
         "bsiv": BSIVLoss(),
     }
     criterion = loss_map[cfg["training"]["loss_fn"].lower()]
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg["training"]["learning_rate"],
-        weight_decay=cfg["training"]["weight_decay"],
-    )
+    optimizer = build_optimizer(model, cfg["training"]["learning_rate"], cfg["training"]["weight_decay"], device)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -284,7 +265,7 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
         uncertainty = variance.squeeze(1)
 
         # 2. Surface curvature (GPU)
-        curvature = compute_pool_curvature(model, x_pool_norm, batch_size=2048)
+        curvature = compute_pool_curvature(model, x_pool_norm, batch_size=eval_batch_size)
 
         # 3. Combined acquisition score (GPU)
         u_norm = (uncertainty - uncertainty.min()) / (uncertainty.max() - uncertainty.min() + 1e-8)
@@ -312,15 +293,7 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
 
         w_train = compute_vega_weights(x_train_raw) if use_vega_loss else None
         x_train_norm = normalize_features(x_train_raw, bounds)
-        train_loader = create_dataloader(
-            x_train_norm,
-            y_train,
-            w_train,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-        )
+        train_loader = create_dataloader(x_train_norm, y_train, w_train, batch_size=batch_size, shuffle=True, device=device)
 
         for epoch in range(1, epochs_per_round + 1):
             train_loss = run_epoch(
@@ -330,12 +303,9 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
         scheduler.step(val_loss)
 
         current_lr = optimizer.param_groups[0]["lr"]
-        mean_uncert = uncertainty[top_indices.to(device)].mean().item()
-        mean_curv = curvature[top_indices.to(device)].mean().item()
+        mean_uncert = uncertainty[top_indices].mean().item()
+        mean_curv = curvature[top_indices].mean().item()
         print(f"[Active Round {r:02d}/{rounds}] Samples: {len(x_train_raw):5d} | LR: {current_lr:.1e} | Uncert: {mean_uncert:.2e} | Curv: {mean_curv:.2e} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss

@@ -1,6 +1,6 @@
 model_name: "surrogate_mlp"
 input_dim: 13
 hidden_layers: [256, 512, 512, 512, 512]
-activation: "gelu"
+activation: "selu"
 dropout_rate: 0.05
 output_dim: 1

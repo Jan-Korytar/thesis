@@ -47,8 +47,8 @@ def load_config(path: str | Path) -> dict[str, Any]:
 
     if "batch_size" not in cfg["training"] and "batch_size" in cfg["data"]:
         cfg["training"]["batch_size"] = cfg["data"]["batch_size"]
-    if "num_workers" not in cfg["training"] and "num_workers" in cfg["data"]:
-        cfg["training"]["num_workers"] = cfg["data"]["num_workers"]
+    if "eval_batch_size" not in cfg["training"]:
+        cfg["training"]["eval_batch_size"] = 16384
     if "use_vega_loss" not in cfg["training"]:
         cfg["training"]["use_vega_loss"] = True
     if "use_amp" not in cfg["training"]:
@@ -61,7 +61,6 @@ def load_config(path: str | Path) -> dict[str, Any]:
         cfg["training"]["lr_factor"] = 0.5
 
     assert "batch_size" in cfg["training"]
-    assert "num_workers" in cfg["training"]
 
     if "mode" not in cfg:
         cfg["mode"] = "active"

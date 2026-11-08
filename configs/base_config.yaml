@@ -1,4 +1,4 @@
-experiment_name: "bates_kou_phase2_bsiv_surrogate"
+experiment_name: "bates_kou_bsiv_surrogate"
 seed: 42
 device: "cuda"
 model_config: "configs/model/mlp.yaml"
@@ -22,10 +22,9 @@ data:
     p_up: [0.00, 1.000]
 
 training:
-  batch_size: 1024
-  num_workers: 0
-  pin_memory: true
-  learning_rate: 0.001
+  batch_size: 2048
+  eval_batch_size: 16384
+  learning_rate: 1.0e-3
   min_learning_rate: 1.0e-5
   lr_patience: 2
   lr_factor: 0.5
@@ -34,19 +33,35 @@ training:
   use_vega_loss: false
   use_amp: true
 
+# Label budget B = initial + rounds * query = 10k + 25 * 3k = 85k (~80k after BSIV validity filter).
+# Passive baseline gets the same 80k training labels (100k * 0.8) for a fair comparison.
 passive:
-  n_samples: 50000
+  n_samples: 100000
   train_split: 0.8
-  epochs: 50
+  epochs: 150
 
 active:
-  initial_samples: 2000
-  rounds: 30
-  query_size: 1000
-  pool_size: 20000
+  initial_samples: 100000
+  rounds: 50
+  query_size: 10000
+  pool_size: 50000
   mc_passes: 20
-  val_samples: 5000
-  epochs_per_round: 25
-  target_val_loss: 0.005
+  val_samples: 100000
+  epochs_per_round: 20
+  target_val_loss: 0.001
   early_stopping_patience: 5
   curvature_weight: 1.5
+
+# Stage 1: architecture + optimizer search on a fixed GPU-cached dataset sized like the final label budget.
+# val_samples=50k gives ~0.45% relative standard error on the MAE, enough to rank trials 1-2% apart.
+optuna:
+  study_name: "bsiv_arch_v1"
+  storage: "optuna/bsiv_arch_v1.journal"
+  n_trials: 80
+  train_samples: 80000
+  val_samples: 50000
+  epochs: 60
+  warmup_epochs: 3
+  report_every: 3
+  prune_warmup_reports: 4
+  startup_trials: 10

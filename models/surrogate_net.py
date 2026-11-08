@@ -58,8 +58,9 @@ def predict_mc_dropout(model: nn.Module, x: torch.Tensor, n_passes: int) -> tupl
         if isinstance(module, nn.Dropout):
             module.train()
 
-    with torch.no_grad():
-        preds = torch.stack([model(x) for _ in range(n_passes)], dim=0)
+    use_amp = x.device.type == "cuda"
+    with torch.no_grad(), torch.amp.autocast(device_type=x.device.type, enabled=use_amp):
+        preds = torch.stack([model(x).float() for _ in range(n_passes)], dim=0)
 
     mean = preds.mean(dim=0)
     var = preds.var(dim=0)

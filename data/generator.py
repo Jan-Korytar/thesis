@@ -20,10 +20,13 @@ PARAM_NAMES = [
 ]
 
 
-def price_bates_call(x: torch.Tensor, n_quad: int = 128) -> torch.Tensor:
+def price_bates_call(x: torch.Tensor, n_quad: int = 128, chunk_size: int = 32768) -> torch.Tensor:
     assert x.ndim == 2
     assert x.shape[1] == 13
+    return torch.cat([_price_bates_chunk(x[i : i + chunk_size], n_quad) for i in range(0, x.shape[0], chunk_size)])
 
+
+def _price_bates_chunk(x: torch.Tensor, n_quad: int) -> torch.Tensor:
     device = x.device
     dtype = torch.float64
     cdtype = torch.complex128

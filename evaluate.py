@@ -38,14 +38,14 @@ def compute_true_greeks(x_raw: torch.Tensor, h: float = 1e-4) -> tuple[torch.Ten
 
 def evaluate(
     checkpoint_path: str = "checkpoints/best_surrogate.pt",
-    n_test_samples: int = 2000,
+    n_test_samples: int = 10000,
     seed: int = 999,
 ) -> dict[str, float]:
     ckpt_path = Path(checkpoint_path)
     assert ckpt_path.is_file(), f"Checkpoint not found: {ckpt_path}"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt["cfg"]
     is_bsiv = cfg.get("target_type") == "bsiv"
 
@@ -58,17 +58,12 @@ def evaluate(
     test_bounds["moneyness"] = [-0.5, 0.5]
 
     if is_bsiv:
-        x_test, y_true_bsiv = generate_bates_bsiv_data(test_bounds, n_test_samples, seed=seed)
-        c_true, delta_true, gamma_true = compute_true_greeks(x_test)
+        x_test_cuda, y_true_bsiv = generate_bates_bsiv_data(test_bounds, n_test_samples, seed=seed, device=device)
+        c_true, delta_true, gamma_true = compute_true_greeks(x_test_cuda)
     else:
-        x_test = sample_parameters(test_bounds, n_test_samples, seed=seed)
-        c_true, delta_true, gamma_true = compute_true_greeks(x_test)
+        x_test_cuda = sample_parameters(test_bounds, n_test_samples, seed=seed, device=device)
+        c_true, delta_true, gamma_true = compute_true_greeks(x_test_cuda)
         y_true_bsiv = None
-
-    x_test_cuda = x_test.to(device)
-    c_true = c_true.to(device)
-    delta_true = delta_true.to(device)
-    gamma_true = gamma_true.to(device)
 
     low_m, high_m = bounds["moneyness"]
     scale_m = 2.0 / (high_m - low_m)
@@ -145,7 +140,7 @@ def evaluate(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate Deep Surrogate on Chen et al. Test Suite")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/best_surrogate.pt")
-    parser.add_argument("--n-test", type=int, default=2000)
+    parser.add_argument("--n-test", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=999)
     args = parser.parse_args()
 

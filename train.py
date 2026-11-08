@@ -1,4 +1,5 @@
 import argparse
+import math
 from pathlib import Path
 import random
 from typing import Any
@@ -63,6 +64,31 @@ def resolve_device(device_str: str) -> torch.device:
 
 def build_optimizer(model: nn.Module, lr: float, weight_decay: float, device: torch.device) -> torch.optim.Optimizer:
     return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, fused=device.type == "cuda")
+
+
+def build_warm_restart_cosine_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_epochs: int,
+    base_lr: float,
+    min_lr: float,
+    n_restarts: int = 3,
+    restart_fraction: float = 0.5,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    half_epochs = max(int(total_epochs * restart_fraction), 1)
+    cycle_len = max(half_epochs // n_restarts, 1)
+    min_ratio = min_lr / base_lr
+
+    def lr_lambda(epoch: int) -> float:
+        if epoch < half_epochs:
+            progress = (epoch % cycle_len) / cycle_len
+            cos_val = 0.5 * (1.0 + math.cos(math.pi * progress))
+        else:
+            remaining_total = max(total_epochs - half_epochs, 1)
+            progress = min(max((epoch - half_epochs) / remaining_total, 0.0), 1.0)
+            cos_val = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cos_val
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def run_epoch(
@@ -162,22 +188,19 @@ def train_passive(cfg: dict[str, Any]) -> nn.Module:
         "bsiv": BSIVLoss(),
     }
     criterion = loss_map[cfg["training"]["loss_fn"].lower()]
-    optimizer = build_optimizer(model, cfg["training"]["learning_rate"], cfg["training"]["weight_decay"], device)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    epochs = passive_cfg["epochs"]
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        mode="min",
-        factor=cfg["training"]["lr_factor"],
-        patience=cfg["training"]["lr_patience"],
-        min_lr=cfg["training"]["min_learning_rate"],
+        T_max=epochs,
+        eta_min=cfg["training"]["min_learning_rate"],
     )
 
     best_val_loss = float("inf")
-    epochs = passive_cfg["epochs"]
     for epoch in range(1, epochs + 1):
+        current_lr = optimizer.param_groups[0]["lr"]
         train_loss = run_epoch(model, train_loader, criterion, optimizer, device, scaler=scaler, use_amp=use_amp)
         val_loss = run_epoch(model, val_loader, criterion, None, device, scaler=None, use_amp=False)
-        scheduler.step(val_loss)
-        current_lr = optimizer.param_groups[0]["lr"]
+        scheduler.step()
         print(f"[Passive] Epoch {epoch:03d}/{epochs:03d} | LR: {current_lr:.1e} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
         if val_loss < best_val_loss:
@@ -197,6 +220,15 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
     is_bsiv = cfg.get("target_type") == "bsiv"
 
     active_cfg = cfg["active"]
+    epochs_per_round = active_cfg["epochs_per_round"]
+    rounds = active_cfg["rounds"]
+    pool_size = active_cfg["pool_size"]
+    query_size = active_cfg["query_size"]
+    mc_passes = active_cfg["mc_passes"]
+    target_val_loss = active_cfg["target_val_loss"]
+    early_stopping_patience = active_cfg["early_stopping_patience"]
+    curvature_weight = active_cfg["curvature_weight"]
+
     bounds = cfg["data"]["bounds"]
     val_bounds = get_val_bounds(bounds)
     batch_size = cfg["training"]["batch_size"]
@@ -225,30 +257,22 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
         "bsiv": BSIVLoss(),
     }
     criterion = loss_map[cfg["training"]["loss_fn"].lower()]
-    optimizer = build_optimizer(model, cfg["training"]["learning_rate"], cfg["training"]["weight_decay"], device)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=cfg["training"]["lr_factor"],
-        patience=cfg["training"]["lr_patience"],
+    total_epochs = (rounds + 1) * epochs_per_round
+    scheduler = build_warm_restart_cosine_scheduler(
+        optimizer=optimizer,
+        total_epochs=total_epochs,
+        base_lr=cfg["training"]["learning_rate"],
         min_lr=cfg["training"]["min_learning_rate"],
+        n_restarts=3,
+        restart_fraction=0.5,
     )
-
-    epochs_per_round = active_cfg["epochs_per_round"]
-    rounds = active_cfg["rounds"]
-    pool_size = active_cfg["pool_size"]
-    query_size = active_cfg["query_size"]
-    mc_passes = active_cfg["mc_passes"]
-    target_val_loss = active_cfg["target_val_loss"]
-    early_stopping_patience = active_cfg["early_stopping_patience"]
-    curvature_weight = active_cfg["curvature_weight"]
 
     for epoch in range(1, epochs_per_round + 1):
         train_loss = run_epoch(
             model, train_loader, criterion, optimizer, device, use_weights=use_vega_loss, scaler=scaler, use_amp=use_amp
         )
+        scheduler.step()
     val_loss = run_epoch(model, val_loader, criterion, None, device, use_weights=False, scaler=None, use_amp=False)
-    scheduler.step(val_loss)
     current_lr = optimizer.param_groups[0]["lr"]
     print(f"[Active Round 00] Samples: {len(x_train_raw):5d} | LR: {current_lr:.1e} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
@@ -299,8 +323,8 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
             train_loss = run_epoch(
                 model, train_loader, criterion, optimizer, device, use_weights=use_vega_loss, scaler=scaler, use_amp=use_amp
             )
+            scheduler.step()
         val_loss = run_epoch(model, val_loader, criterion, None, device, use_weights=False, scaler=None, use_amp=False)
-        scheduler.step(val_loss)
 
         current_lr = optimizer.param_groups[0]["lr"]
         mean_uncert = uncertainty[top_indices].mean().item()

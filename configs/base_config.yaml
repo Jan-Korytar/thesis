@@ -22,13 +22,13 @@ data:
     p_up: [0.00, 1.000]
 
 training:
-  batch_size: 2048
+  batch_size: 512
   eval_batch_size: 16384
   learning_rate: 1.0e-3
   min_learning_rate: 1.0e-5
   lr_patience: 2
   lr_factor: 0.5
-  weight_decay: 1.0e-5
+  weight_decay: 0.0
   loss_fn: "bsiv"
   use_vega_loss: false
   use_amp: true

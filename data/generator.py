@@ -185,7 +185,7 @@ def generate_bates_bsiv_data(
 
     while collected_count < n_samples:
         needed = n_samples - collected_count
-        batch_n = max(needed * 2, 1000)
+        batch_n = min(max(needed * 2, 1000), 100000)
         x_cand = sample_parameters(bounds, batch_n, cur_seed, device=device)
         if cur_seed is not None:
             cur_seed += 1000

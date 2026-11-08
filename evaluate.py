@@ -68,52 +68,73 @@ def evaluate(
     low_m, high_m = bounds["moneyness"]
     scale_m = 2.0 / (high_m - low_m)
 
-    x_norm = normalize_features(x_test_cuda, bounds).detach().requires_grad_(True)
-    out = model(x_norm)
+    total_price_ae = 0.0
+    total_bsiv_se = 0.0
+    valid_bsiv_count = 0
+    total_delta_ae = 0.0
+    total_gamma_ae = 0.0
+    n_total = len(x_test_cuda)
+    eval_batch_size = cfg.get("training", {}).get("eval_batch_size", 16384)
 
-    m = x_test_cuda[:, 0]
-    tau = x_test_cuda[:, 1] / 365.0
-    r = x_test_cuda[:, 3]
-    q = x_test_cuda[:, 4]
+    for i in range(0, n_total, eval_batch_size):
+        bx_test = x_test_cuda[i : i + eval_batch_size]
+        bc_true = c_true[i : i + eval_batch_size]
+        bdelta_true = delta_true[i : i + eval_batch_size]
+        bgamma_true = gamma_true[i : i + eval_batch_size] if gamma_true is not None else None
+        by_true_bsiv = y_true_bsiv[i : i + eval_batch_size] if y_true_bsiv is not None else None
 
-    if is_bsiv:
-        bsiv_pred = out.squeeze(-1)
-        bsiv_true = y_true_bsiv.to(device).squeeze(-1) if y_true_bsiv is not None else invert_bsiv(c_true.squeeze(-1), m, tau, r, q)
-        price_pred = bs_call_price(m, tau, r, q, bsiv_pred).unsqueeze(1)
-        price_mae = torch.mean(torch.abs(price_pred - c_true)).item()
-        bsiv_rmse = torch.sqrt(torch.mean((bsiv_pred - bsiv_true) ** 2)).item()
+        bx_norm = normalize_features(bx_test, bounds).detach().requires_grad_(True)
+        bout = model(bx_norm)
 
-        # Compute Greeks from BSIV surrogate
-        grad_out = torch.autograd.grad(out.sum(), x_norm, create_graph=True)[0]
-        d_sig_dm = grad_out[:, 0] * scale_m
+        bm = bx_test[:, 0]
+        btau = bx_test[:, 1] / 365.0
+        br = bx_test[:, 3]
+        bq = bx_test[:, 4]
 
-        k = torch.exp(-m)
-        sqrt_tau = torch.sqrt(tau)
-        d1 = (m + (r - q + 0.5 * bsiv_pred**2) * tau) / (bsiv_pred * sqrt_tau)
-        c1 = 0.5 * (1.0 + torch.erf(d1 / np.sqrt(2.0)))
-        delta_bs = torch.exp(-q * tau) * c1
-        vega_bs = torch.exp(-q * tau) * sqrt_tau * (1.0 / np.sqrt(2.0 * np.pi)) * torch.exp(-0.5 * d1**2)
-        delta_pred = (delta_bs + vega_bs * d_sig_dm).unsqueeze(1)
-        delta_mae = torch.mean(torch.abs(delta_pred - delta_true)).item()
-        gamma_mae = 0.0  # Optional higher-order Greek
-    else:
-        price_pred = out
-        price_mae = torch.mean(torch.abs(price_pred - c_true)).item()
+        if is_bsiv:
+            bbsiv_pred = bout.squeeze(-1)
+            bbsiv_true = by_true_bsiv.to(device).squeeze(-1) if by_true_bsiv is not None else invert_bsiv(bc_true.squeeze(-1), bm, btau, br, bq)
+            bprice_pred = bs_call_price(bm, btau, br, bq, bbsiv_pred).unsqueeze(1)
+            total_price_ae += torch.sum(torch.abs(bprice_pred - bc_true)).item()
 
-        bsiv_true = invert_bsiv(c_true.squeeze(-1), m, tau, r, q)
-        bsiv_pred = invert_bsiv(price_pred.squeeze(-1), m, tau, r, q)
-        valid = torch.isfinite(bsiv_true) & torch.isfinite(bsiv_pred)
-        bsiv_rmse = torch.sqrt(torch.mean((bsiv_pred[valid] - bsiv_true[valid]) ** 2)).item()
+            valid_bsiv = torch.isfinite(bbsiv_true) & torch.isfinite(bbsiv_pred)
+            total_bsiv_se += torch.sum((bbsiv_pred[valid_bsiv] - bbsiv_true[valid_bsiv]) ** 2).item()
+            valid_bsiv_count += valid_bsiv.sum().item()
 
-        grad_out = torch.autograd.grad(out.sum(), x_norm, create_graph=True)[0]
-        d_c_dm = grad_out[:, 0:1] * scale_m
-        delta_pred = out + d_c_dm
-        delta_mae = torch.mean(torch.abs(delta_pred - delta_true)).item()
+            bgrad_out = torch.autograd.grad(bout.sum(), bx_norm, create_graph=False)[0]
+            bd_sig_dm = bgrad_out[:, 0] * scale_m
 
-        second_grads = torch.autograd.grad(grad_out[:, 0].sum(), x_norm, create_graph=False)[0]
-        d2_c_dm2 = second_grads[:, 0:1] * (scale_m**2)
-        gamma_pred = d_c_dm + d2_c_dm2
-        gamma_mae = torch.mean(torch.abs(gamma_pred - gamma_true)).item()
+            bsqrt_tau = torch.sqrt(btau)
+            bd1 = (bm + (br - bq + 0.5 * bbsiv_pred**2) * btau) / (bbsiv_pred * bsqrt_tau)
+            bc1 = 0.5 * (1.0 + torch.erf(bd1 / np.sqrt(2.0)))
+            bdelta_bs = torch.exp(-bq * btau) * bc1
+            bvega_bs = torch.exp(-bq * btau) * bsqrt_tau * (1.0 / np.sqrt(2.0 * np.pi)) * torch.exp(-0.5 * bd1**2)
+            bdelta_pred = (bdelta_bs + bvega_bs * bd_sig_dm).unsqueeze(1)
+            total_delta_ae += torch.sum(torch.abs(bdelta_pred - bdelta_true)).item()
+        else:
+            bprice_pred = bout
+            total_price_ae += torch.sum(torch.abs(bprice_pred - bc_true)).item()
+
+            bbsiv_true = invert_bsiv(bc_true.squeeze(-1), bm, btau, br, bq)
+            bbsiv_pred = invert_bsiv(bprice_pred.squeeze(-1), bm, btau, br, bq)
+            valid = torch.isfinite(bbsiv_true) & torch.isfinite(bbsiv_pred)
+            total_bsiv_se += torch.sum((bbsiv_pred[valid] - bbsiv_true[valid]) ** 2).item()
+            valid_bsiv_count += valid.sum().item()
+
+            bgrad_out = torch.autograd.grad(bout.sum(), bx_norm, create_graph=True)[0]
+            bd_c_dm = bgrad_out[:, 0:1] * scale_m
+            bdelta_pred = bout + bd_c_dm
+            total_delta_ae += torch.sum(torch.abs(bdelta_pred - bdelta_true)).item()
+
+            bsecond_grads = torch.autograd.grad(bgrad_out[:, 0].sum(), bx_norm, create_graph=False)[0]
+            bd2_c_dm2 = bsecond_grads[:, 0:1] * (scale_m**2)
+            bgamma_pred = bd_c_dm + bd2_c_dm2
+            total_gamma_ae += torch.sum(torch.abs(bgamma_pred - bgamma_true)).item()
+
+    price_mae = total_price_ae / n_total
+    bsiv_rmse = float(np.sqrt(total_bsiv_se / max(valid_bsiv_count, 1)))
+    delta_mae = total_delta_ae / n_total
+    gamma_mae = (total_gamma_ae / n_total) if not is_bsiv else 0.0
 
     print("\n" + "=" * 60)
     print("      DEEP BATES-KOU SURROGATE: CHEN ET AL. TEST SUITE      ")

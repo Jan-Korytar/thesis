@@ -22,8 +22,9 @@ data:
     p_up: [0.00, 1.000]
 
 training:
-  batch_size: 256
+  batch_size: 1024
   num_workers: 0
+  pin_memory: true
   learning_rate: 0.001
   min_learning_rate: 1.0e-5
   lr_patience: 2
@@ -39,12 +40,12 @@ passive:
   epochs: 50
 
 active:
-  initial_samples: 100_000
-  rounds: 100
-  query_size: 5_000
-  pool_size: 50_000
+  initial_samples: 2000
+  rounds: 30
+  query_size: 1000
+  pool_size: 20000
   mc_passes: 20
-  val_samples: 100_000
+  val_samples: 5000
   epochs_per_round: 25
   target_val_loss: 0.005
   early_stopping_patience: 5

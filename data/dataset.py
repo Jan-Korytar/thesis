@@ -23,9 +23,10 @@ def create_dataloader(
     x: torch.Tensor,
     y: torch.Tensor,
     w: torch.Tensor | None = None,
-    batch_size: int = 256,
+    batch_size: int = 1024,
     shuffle: bool = True,
     num_workers: int = 0,
+    pin_memory: bool = True,
 ) -> DataLoader:
     assert batch_size > 0
     assert num_workers >= 0
@@ -35,6 +36,7 @@ def create_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
     )
 
 
@@ -45,6 +47,7 @@ def build_dataloaders(
     batch_size: int,
     num_workers: int,
     seed: int,
+    pin_memory: bool = True,
 ) -> tuple[DataLoader, DataLoader]:
     assert 0.0 < train_split < 1.0
     assert batch_size > 0
@@ -65,11 +68,13 @@ def build_dataloaders(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
     )
     val_loader = DataLoader(
         val_set,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
     )
     return train_loader, val_loader

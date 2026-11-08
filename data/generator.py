@@ -129,18 +129,19 @@ def invert_bsiv(
     return sigma
 
 
-def sample_parameters(bounds: dict[str, list[float]], n_samples: int, seed: int | None = None) -> torch.Tensor:
+def sample_parameters(
+    bounds: dict[str, list[float]],
+    n_samples: int,
+    seed: int | None = None,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
     assert n_samples > 0
-    generator = torch.Generator().manual_seed(seed) if seed is not None else None
+    generator = torch.Generator(device="cpu").manual_seed(seed) if seed is not None else None
 
-    cols = []
-    for name in PARAM_NAMES:
-        low, high = bounds[name]
-        assert low <= high
-        col = torch.empty(n_samples).uniform_(low, high, generator=generator)
-        cols.append(col)
-
-    features = torch.stack(cols, dim=1)
+    lows = torch.tensor([bounds[name][0] for name in PARAM_NAMES], dtype=torch.float32)
+    highs = torch.tensor([bounds[name][1] for name in PARAM_NAMES], dtype=torch.float32)
+    u = torch.rand(n_samples, len(PARAM_NAMES), generator=generator)
+    features = (lows + u * (highs - lows)).to(device)
     assert features.shape == (n_samples, 13)
     return features
 
@@ -157,8 +158,9 @@ def generate_bates_data(
     bounds: dict[str, list[float]],
     n_samples: int,
     seed: int | None = None,
+    device: torch.device | str = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    x = sample_parameters(bounds, n_samples, seed)
+    x = sample_parameters(bounds, n_samples, seed, device=device)
     y = price_bates_call(x).unsqueeze(1)
 
     assert not torch.isnan(x).any()
@@ -171,6 +173,7 @@ def generate_bates_bsiv_data(
     bounds: dict[str, list[float]],
     n_samples: int,
     seed: int | None = None,
+    device: torch.device | str = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     collected_x: list[torch.Tensor] = []
     collected_y: list[torch.Tensor] = []
@@ -180,7 +183,7 @@ def generate_bates_bsiv_data(
     while collected_count < n_samples:
         needed = n_samples - collected_count
         batch_n = max(needed * 2, 1000)
-        x_cand = sample_parameters(bounds, batch_n, cur_seed)
+        x_cand = sample_parameters(bounds, batch_n, cur_seed, device=device)
         if cur_seed is not None:
             cur_seed += 1000
 

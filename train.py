@@ -45,7 +45,7 @@ def compute_vega_weights(x_raw: torch.Tensor, eps: float = 0.01, max_weight: flo
     return torch.clamp(norm_weights, min=0.1, max=max_weight).unsqueeze(1).float()
 
 
-def compute_pool_curvature(model: nn.Module, x_norm: torch.Tensor, batch_size: int = 1024) -> torch.Tensor:
+def compute_pool_curvature(model: nn.Module, x_norm: torch.Tensor, batch_size: int = 2048) -> torch.Tensor:
     curvatures = []
     model.eval()
     for i in range(0, len(x_norm), batch_size):
@@ -53,7 +53,7 @@ def compute_pool_curvature(model: nn.Module, x_norm: torch.Tensor, batch_size: i
         pred = model(bx)
         grad1 = torch.autograd.grad(pred.sum(), bx, create_graph=True)[0][:, 0]
         grad2 = torch.autograd.grad(grad1.sum(), bx, create_graph=False)[0][:, 0]
-        curvatures.append(torch.abs(grad2).detach().cpu())
+        curvatures.append(torch.abs(grad2).detach())
         del bx, pred, grad1, grad2
 
     if torch.cuda.is_available():
@@ -81,9 +81,9 @@ def run_epoch(
 
     with torch.set_grad_enabled(is_train):
         for bx, by, bw in loader:
-            bx = bx.to(device)
-            by = by.to(device)
-            bw = bw.to(device)
+            bx = bx.to(device, non_blocking=True)
+            by = by.to(device, non_blocking=True)
+            bw = bw.to(device, non_blocking=True)
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -148,6 +148,7 @@ def train_passive(cfg: dict[str, Any]) -> nn.Module:
         x, y = generate_bates_data(bounds, passive_cfg["n_samples"], seed=cfg["seed"])
     x_norm = normalize_features(x, bounds)
 
+    pin_memory = cfg["training"].get("pin_memory", True)
     train_loader, val_loader = build_dataloaders(
         x=x_norm,
         y=y,
@@ -155,6 +156,7 @@ def train_passive(cfg: dict[str, Any]) -> nn.Module:
         batch_size=cfg["training"]["batch_size"],
         num_workers=cfg["training"]["num_workers"],
         seed=cfg["seed"],
+        pin_memory=pin_memory,
     )
 
     model = build_model(cfg).to(device)
@@ -209,21 +211,26 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
     val_bounds = get_val_bounds(bounds)
     batch_size = cfg["training"]["batch_size"]
     num_workers = cfg["training"]["num_workers"]
+    pin_memory = cfg["training"].get("pin_memory", True)
     use_vega_loss = cfg["training"]["use_vega_loss"] and not is_bsiv
 
     if is_bsiv:
-        x_val_raw, y_val = generate_bates_bsiv_data(val_bounds, active_cfg["val_samples"], seed=cfg["seed"] + 1)
-        x_train_raw, y_train = generate_bates_bsiv_data(bounds, active_cfg["initial_samples"], seed=cfg["seed"])
+        x_val_raw, y_val = generate_bates_bsiv_data(val_bounds, active_cfg["val_samples"], seed=cfg["seed"] + 1, device=device)
+        x_train_raw, y_train = generate_bates_bsiv_data(bounds, active_cfg["initial_samples"], seed=cfg["seed"], device=device)
     else:
-        x_val_raw, y_val = generate_bates_data(val_bounds, active_cfg["val_samples"], seed=cfg["seed"] + 1)
-        x_train_raw, y_train = generate_bates_data(bounds, active_cfg["initial_samples"], seed=cfg["seed"])
+        x_val_raw, y_val = generate_bates_data(val_bounds, active_cfg["val_samples"], seed=cfg["seed"] + 1, device=device)
+        x_train_raw, y_train = generate_bates_data(bounds, active_cfg["initial_samples"], seed=cfg["seed"], device=device)
 
     x_val_norm = normalize_features(x_val_raw, bounds)
-    val_loader = create_dataloader(x_val_norm, y_val, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    val_loader = create_dataloader(
+        x_val_norm, y_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory
+    )
 
     w_train = compute_vega_weights(x_train_raw) if use_vega_loss else None
     x_train_norm = normalize_features(x_train_raw, bounds)
-    train_loader = create_dataloader(x_train_norm, y_train, w_train, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    train_loader = create_dataloader(
+        x_train_norm, y_train, w_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
+    )
 
     model = build_model(cfg).to(device)
     loss_map = {
@@ -269,17 +276,17 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
     patience_counter = 0
 
     for r in range(1, rounds + 1):
-        x_pool_raw = sample_parameters(bounds, pool_size, seed=cfg["seed"] + 100 * r)
+        x_pool_raw = sample_parameters(bounds, pool_size, seed=cfg["seed"] + 100 * r, device=device)
         x_pool_norm = normalize_features(x_pool_raw, bounds)
 
-        # 1. Epistemic uncertainty
-        _, variance = predict_mc_dropout(model, x_pool_norm.to(device), mc_passes)
-        uncertainty = variance.squeeze(1).cpu()
+        # 1. Epistemic uncertainty (GPU)
+        _, variance = predict_mc_dropout(model, x_pool_norm, mc_passes)
+        uncertainty = variance.squeeze(1)
 
-        # 2. Surface curvature
-        curvature = compute_pool_curvature(model, x_pool_norm.to(device), batch_size=1024)
+        # 2. Surface curvature (GPU)
+        curvature = compute_pool_curvature(model, x_pool_norm, batch_size=2048)
 
-        # 3. Combined acquisition score
+        # 3. Combined acquisition score (GPU)
         u_norm = (uncertainty - uncertainty.min()) / (uncertainty.max() - uncertainty.min() + 1e-8)
         c_norm = (curvature - curvature.min()) / (curvature.max() - curvature.min() + 1e-8)
         score = u_norm + curvature_weight * c_norm
@@ -305,7 +312,15 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
 
         w_train = compute_vega_weights(x_train_raw) if use_vega_loss else None
         x_train_norm = normalize_features(x_train_raw, bounds)
-        train_loader = create_dataloader(x_train_norm, y_train, w_train, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        train_loader = create_dataloader(
+            x_train_norm,
+            y_train,
+            w_train,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
 
         for epoch in range(1, epochs_per_round + 1):
             train_loss = run_epoch(
@@ -315,8 +330,8 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
         scheduler.step(val_loss)
 
         current_lr = optimizer.param_groups[0]["lr"]
-        mean_uncert = uncertainty[top_indices].mean().item()
-        mean_curv = curvature[top_indices].mean().item()
+        mean_uncert = uncertainty[top_indices.to(device)].mean().item()
+        mean_curv = curvature[top_indices.to(device)].mean().item()
         print(f"[Active Round {r:02d}/{rounds}] Samples: {len(x_train_raw):5d} | LR: {current_lr:.1e} | Uncert: {mean_uncert:.2e} | Curv: {mean_curv:.2e} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
         if torch.cuda.is_available():

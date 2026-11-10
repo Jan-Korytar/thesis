@@ -87,6 +87,15 @@ def load_config(path: str | Path) -> dict[str, Any]:
             active_cfg["early_stopping_patience"] = 5
         if "curvature_weight" not in active_cfg:
             active_cfg["curvature_weight"] = 1.0
+        if "acquisition_strategy" not in active_cfg:
+            active_cfg["acquisition_strategy"] = "grad_norm"
+        if "uniform_ratio" not in active_cfg:
+            active_cfg["uniform_ratio"] = 0.25
+
+        valid_strategies = ("uncertainty", "grad_norm", "vega_uncertainty", "delta_variance", "ema", "curvature")
+        assert active_cfg["acquisition_strategy"].lower() in valid_strategies, (
+            f"Unknown acquisition_strategy '{active_cfg['acquisition_strategy']}'. Choose from {valid_strategies}"
+        )
     else:
         if "passive" not in cfg:
             cfg["passive"] = {

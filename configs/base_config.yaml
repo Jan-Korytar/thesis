@@ -41,6 +41,9 @@ passive:
   epochs: 150
 
 active:
+  # Options: "uncertainty" | "grad_norm" | "vega_uncertainty" | "delta_variance" | "ema" | "curvature"
+  acquisition_strategy: "grad_norm"
+  uniform_ratio: 0.25
   initial_samples: 100000
   rounds: 50
   query_size: 10000
@@ -50,7 +53,7 @@ active:
   epochs_per_round: 20
   target_val_loss: 0.001
   early_stopping_patience: 5
-  curvature_weight: 1.5
+  curvature_weight: 1.0
 
 # Stage 1: architecture + optimizer search on a fixed GPU-cached dataset sized like the final label budget.
 # val_samples=50k gives ~0.45% relative standard error on the MAE, enough to rank trials 1-2% apart.

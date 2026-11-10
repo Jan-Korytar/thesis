@@ -1,4 +1,5 @@
 import argparse
+import copy
 import math
 from pathlib import Path
 import random
@@ -28,7 +29,7 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def compute_vega_weights(x_raw: torch.Tensor, eps: float = 0.01, max_weight: float = 20.0) -> torch.Tensor:
+def compute_bs_vega(x_raw: torch.Tensor) -> torch.Tensor:
     m = x_raw[:, 0]
     tau = torch.clamp(x_raw[:, 1] / 365.0, min=1e-4)
     v_t = torch.clamp(x_raw[:, 2], min=1e-4)
@@ -39,8 +40,11 @@ def compute_vega_weights(x_raw: torch.Tensor, eps: float = 0.01, max_weight: flo
     sqrt_tau = torch.sqrt(tau)
     d1 = (m + (r - q + 0.5 * sig**2) * tau) / (sig * sqrt_tau)
     phi = (1.0 / np.sqrt(2.0 * np.pi)) * torch.exp(-0.5 * d1**2)
-    vega = torch.exp(-q * tau) * sqrt_tau * phi
+    return (torch.exp(-q * tau) * sqrt_tau * phi).float()
 
+
+def compute_vega_weights(x_raw: torch.Tensor, eps: float = 0.01, max_weight: float = 20.0) -> torch.Tensor:
+    vega = compute_bs_vega(x_raw)
     raw_weights = 1.0 / (vega + eps)
     norm_weights = raw_weights / raw_weights.mean()
     return torch.clamp(norm_weights, min=0.1, max=max_weight).unsqueeze(1).float()
@@ -56,6 +60,138 @@ def compute_pool_curvature(model: nn.Module, x_norm: torch.Tensor, batch_size: i
         grad2 = torch.autograd.grad(grad1.sum(), bx, create_graph=False)[0][:, 0]
         curvatures.append(torch.abs(grad2).detach())
     return torch.cat(curvatures, dim=0)
+
+
+def compute_pool_grad_norm(model: nn.Module, x_norm: torch.Tensor, batch_size: int = 8192) -> torch.Tensor:
+    norms = []
+    model.eval()
+    for i in range(0, len(x_norm), batch_size):
+        bx = x_norm[i : i + batch_size].clone().detach().requires_grad_(True)
+        pred = model(bx)
+        grads = torch.autograd.grad(pred.sum(), bx, create_graph=False)[0]
+        norms.append(torch.linalg.vector_norm(grads, ord=2, dim=1).detach())
+    return torch.cat(norms, dim=0)
+
+
+def compute_pool_delta_variance(
+    model: nn.Module, x_norm: torch.Tensor, n_passes: int = 20, batch_size: int = 8192
+) -> tuple[torch.Tensor, torch.Tensor]:
+    val_vars = []
+    delta_vars = []
+    model.eval()
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.train()
+
+    for i in range(0, len(x_norm), batch_size):
+        bx = x_norm[i : i + batch_size].clone().detach().requires_grad_(True)
+        preds = []
+        deltas = []
+        for _ in range(n_passes):
+            out = model(bx)
+            g = torch.autograd.grad(out.sum(), bx, create_graph=False)[0][:, 0]
+            preds.append(out.detach().squeeze(1).float())
+            deltas.append(g.detach().float())
+        val_vars.append(torch.stack(preds, dim=0).var(dim=0))
+        delta_vars.append(torch.stack(deltas, dim=0).var(dim=0))
+
+    model.eval()
+    return torch.cat(val_vars, dim=0), torch.cat(delta_vars, dim=0)
+
+
+def robust_minmax(t: torch.Tensor, q: float = 0.99) -> torch.Tensor:
+    cap = torch.quantile(t.float(), q)
+    clipped = torch.clamp(t.float(), max=cap)
+    return (clipped - clipped.min()) / (clipped.max() - clipped.min() + 1e-8)
+
+
+@torch.no_grad()
+def update_ema_model(model: nn.Module, ema_model: nn.Module, decay: float = 0.995) -> None:
+    for p, ema_p in zip(model.parameters(), ema_model.parameters()):
+        ema_p.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
+
+
+def select_active_samples(
+    strategy: str,
+    model: nn.Module,
+    ema_model: nn.Module | None,
+    x_pool_raw: torch.Tensor,
+    x_pool_norm: torch.Tensor,
+    query_size: int,
+    mc_passes: int,
+    curvature_weight: float,
+    eval_batch_size: int,
+    uniform_ratio: float = 0.25,
+) -> tuple[torch.Tensor, float, float]:
+    strategy = strategy.lower()
+    device = x_pool_raw.device
+
+    if strategy == "uncertainty":
+        _, variance = predict_mc_dropout(model, x_pool_norm, mc_passes)
+        uncertainty = variance.squeeze(1)
+        aux_metric = torch.zeros_like(uncertainty)
+        score = robust_minmax(uncertainty)
+
+    elif strategy == "grad_norm":
+        _, variance = predict_mc_dropout(model, x_pool_norm, mc_passes)
+        uncertainty = variance.squeeze(1)
+        aux_metric = compute_pool_grad_norm(model, x_pool_norm, batch_size=eval_batch_size)
+        score = robust_minmax(uncertainty) + curvature_weight * robust_minmax(aux_metric)
+
+    elif strategy == "vega_uncertainty":
+        _, variance = predict_mc_dropout(model, x_pool_norm, mc_passes)
+        uncertainty = variance.squeeze(1)
+        aux_metric = compute_bs_vega(x_pool_raw)
+        score = robust_minmax(uncertainty * aux_metric)
+
+    elif strategy == "delta_variance":
+        uncertainty, aux_metric = compute_pool_delta_variance(
+            model, x_pool_norm, n_passes=mc_passes, batch_size=eval_batch_size
+        )
+        score = robust_minmax(uncertainty) + curvature_weight * robust_minmax(aux_metric)
+
+    elif strategy == "ema":
+        assert ema_model is not None
+        model.eval()
+        ema_model.eval()
+        with torch.no_grad():
+            pred_cur = model(x_pool_norm).squeeze(1).float()
+            pred_ema = ema_model(x_pool_norm).squeeze(1).float()
+            uncertainty = torch.abs(pred_cur - pred_ema)
+        aux_metric = compute_pool_grad_norm(model, x_pool_norm, batch_size=eval_batch_size)
+        score = robust_minmax(uncertainty) + curvature_weight * robust_minmax(aux_metric)
+
+    elif strategy == "curvature":
+        _, variance = predict_mc_dropout(model, x_pool_norm, mc_passes)
+        uncertainty = variance.squeeze(1)
+        aux_metric = compute_pool_curvature(model, x_pool_norm, batch_size=eval_batch_size)
+        score = robust_minmax(uncertainty) + curvature_weight * robust_minmax(aux_metric)
+
+    else:
+        raise ValueError(
+            f"Unknown acquisition_strategy '{strategy}'. Valid options: "
+            "uncertainty, grad_norm, vega_uncertainty, delta_variance, ema, curvature"
+        )
+
+    n_uniform = int(query_size * uniform_ratio)
+    n_active = query_size - n_uniform
+
+    probs = (score**2) + 1e-6
+    active_indices = torch.multinomial(probs, num_samples=n_active, replacement=False)
+
+    if n_uniform > 0:
+        mask = torch.ones(len(x_pool_raw), dtype=torch.bool, device=device)
+        mask[active_indices] = False
+        remaining_indices = torch.where(mask)[0]
+        perm = torch.randperm(len(remaining_indices), device=device)[:n_uniform]
+        uniform_indices = remaining_indices[perm]
+        top_indices = torch.cat([active_indices, uniform_indices], dim=0)
+    else:
+        top_indices = active_indices
+
+    mean_u = uncertainty[top_indices].mean().item()
+    mean_aux = aux_metric[top_indices].mean().item()
+    return top_indices, mean_u, mean_aux
 
 
 def resolve_device(device_str: str) -> torch.device:
@@ -188,6 +324,7 @@ def train_passive(cfg: dict[str, Any]) -> nn.Module:
         "bsiv": BSIVLoss(),
     }
     criterion = loss_map[cfg["training"]["loss_fn"].lower()]
+    optimizer = build_optimizer(model, cfg["training"]["learning_rate"], cfg["training"]["weight_decay"], device)
     epochs = passive_cfg["epochs"]
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
@@ -228,6 +365,8 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
     target_val_loss = active_cfg["target_val_loss"]
     early_stopping_patience = active_cfg["early_stopping_patience"]
     curvature_weight = active_cfg["curvature_weight"]
+    acquisition_strategy = active_cfg.get("acquisition_strategy", "grad_norm").lower()
+    uniform_ratio = active_cfg.get("uniform_ratio", 0.25)
 
     bounds = cfg["data"]["bounds"]
     val_bounds = get_val_bounds(bounds)
@@ -250,6 +389,8 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
     train_loader = create_dataloader(x_train_norm, y_train, w_train, batch_size=batch_size, shuffle=True, device=device)
 
     model = build_model(cfg).to(device)
+    ema_model = copy.deepcopy(model).eval() if acquisition_strategy == "ema" else None
+
     loss_map = {
         "l1": nn.L1Loss(),
         "mae": nn.L1Loss(),
@@ -272,10 +413,15 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
         train_loss = run_epoch(
             model, train_loader, criterion, optimizer, device, use_weights=use_vega_loss, scaler=scaler, use_amp=use_amp
         )
+        if ema_model is not None:
+            update_ema_model(model, ema_model, decay=0.95)
         scheduler.step()
     val_loss = run_epoch(model, val_loader, criterion, None, device, use_weights=False, scaler=None, use_amp=False)
     current_lr = optimizer.param_groups[0]["lr"]
-    print(f"[Active Round 00] Samples: {len(x_train_raw):5d} | LR: {current_lr:.1e} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+    print(
+        f"[Active Round 00] Samples: {len(x_train_raw):5d} | Strategy: {acquisition_strategy} | "
+        f"LR: {current_lr:.1e} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}"
+    )
 
     best_val_loss = val_loss
     save_checkpoint(model, cfg, best_val_loss, "checkpoints/best_surrogate.pt")
@@ -285,19 +431,18 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
         x_pool_raw = sample_parameters(bounds, pool_size, seed=cfg["seed"] + 100 * r, device=device)
         x_pool_norm = normalize_features(x_pool_raw, bounds)
 
-        # 1. Epistemic uncertainty (GPU)
-        _, variance = predict_mc_dropout(model, x_pool_norm, mc_passes)
-        uncertainty = variance.squeeze(1)
-
-        # 2. Surface curvature (GPU)
-        curvature = compute_pool_curvature(model, x_pool_norm, batch_size=eval_batch_size)
-
-        # 3. Combined acquisition score (GPU)
-        u_norm = (uncertainty - uncertainty.min()) / (uncertainty.max() - uncertainty.min() + 1e-8)
-        c_norm = (curvature - curvature.min()) / (curvature.max() - curvature.min() + 1e-8)
-        score = u_norm + curvature_weight * c_norm
-
-        top_indices = torch.topk(score, k=query_size).indices
+        top_indices, mean_uncert, mean_aux = select_active_samples(
+            strategy=acquisition_strategy,
+            model=model,
+            ema_model=ema_model,
+            x_pool_raw=x_pool_raw,
+            x_pool_norm=x_pool_norm,
+            query_size=query_size,
+            mc_passes=mc_passes,
+            curvature_weight=curvature_weight,
+            eval_batch_size=eval_batch_size,
+            uniform_ratio=uniform_ratio,
+        )
         x_acquired_raw = x_pool_raw[top_indices]
 
         if is_bsiv:
@@ -324,13 +469,16 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
             train_loss = run_epoch(
                 model, train_loader, criterion, optimizer, device, use_weights=use_vega_loss, scaler=scaler, use_amp=use_amp
             )
+            if ema_model is not None:
+                update_ema_model(model, ema_model, decay=0.95)
             scheduler.step()
         val_loss = run_epoch(model, val_loader, criterion, None, device, use_weights=False, scaler=None, use_amp=False)
 
         current_lr = optimizer.param_groups[0]["lr"]
-        mean_uncert = uncertainty[top_indices].mean().item()
-        mean_curv = curvature[top_indices].mean().item()
-        print(f"[Active Round {r:02d}/{rounds}] Samples: {len(x_train_raw):5d} | LR: {current_lr:.1e} | Uncert: {mean_uncert:.2e} | Curv: {mean_curv:.2e} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+        print(
+            f"[Active Round {r:02d}/{rounds}] Samples: {len(x_train_raw):5d} | LR: {current_lr:.1e} | "
+            f"Uncert: {mean_uncert:.2e} | Aux: {mean_aux:.2e} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}"
+        )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss

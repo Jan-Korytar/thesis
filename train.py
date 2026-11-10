@@ -227,6 +227,43 @@ def build_warm_restart_cosine_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    cfg: dict[str, Any],
+    total_epochs: int,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    train_cfg = cfg["training"]
+    sched_type = train_cfg.get("lr_scheduler", "cosine").lower()
+    base_lr = train_cfg["learning_rate"]
+    min_lr = train_cfg["min_learning_rate"]
+
+    if sched_type == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_epochs,
+            eta_min=min_lr,
+        )
+    elif sched_type == "step":
+        step_size = max(total_epochs // 4, 1)
+        gamma = train_cfg.get("lr_factor", 0.5)
+        return torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=step_size,
+            gamma=gamma,
+        )
+    elif sched_type == "warm_restarts":
+        return build_warm_restart_cosine_scheduler(
+            optimizer=optimizer,
+            total_epochs=total_epochs,
+            base_lr=base_lr,
+            min_lr=min_lr,
+            n_restarts=3,
+            restart_fraction=0.5,
+        )
+    else:
+        raise ValueError(f"Unknown lr_scheduler '{sched_type}'. Valid options: cosine, step, warm_restarts")
+
+
 def run_epoch(
     model: nn.Module,
     loader: TensorBatchLoader,
@@ -326,11 +363,7 @@ def train_passive(cfg: dict[str, Any]) -> nn.Module:
     criterion = loss_map[cfg["training"]["loss_fn"].lower()]
     optimizer = build_optimizer(model, cfg["training"]["learning_rate"], cfg["training"]["weight_decay"], device)
     epochs = passive_cfg["epochs"]
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=epochs,
-        eta_min=cfg["training"]["min_learning_rate"],
-    )
+    scheduler = build_scheduler(optimizer, cfg, total_epochs=epochs)
 
     best_val_loss = float("inf")
     for epoch in range(1, epochs + 1):
@@ -400,14 +433,7 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
     criterion = loss_map[cfg["training"]["loss_fn"].lower()]
     optimizer = build_optimizer(model, cfg["training"]["learning_rate"], cfg["training"]["weight_decay"], device)
     total_epochs = (rounds + 1) * epochs_per_round
-    scheduler = build_warm_restart_cosine_scheduler(
-        optimizer=optimizer,
-        total_epochs=total_epochs,
-        base_lr=cfg["training"]["learning_rate"],
-        min_lr=cfg["training"]["min_learning_rate"],
-        n_restarts=3,
-        restart_fraction=0.5,
-    )
+    scheduler = build_scheduler(optimizer, cfg, total_epochs=total_epochs)
 
     for epoch in range(1, epochs_per_round + 1):
         train_loss = run_epoch(

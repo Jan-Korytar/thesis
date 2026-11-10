@@ -22,10 +22,12 @@ data:
     p_up: [0.00, 1.000]
 
 training:
+  # Options: "cosine" | "step" | "warm_restarts"
+  lr_scheduler: "cosine"
   batch_size: 512
   eval_batch_size: 16384
-  learning_rate: 1.0e-3
-  min_learning_rate: 1.0e-5
+  learning_rate: 1.0e-4
+  min_learning_rate: 1.0e-6
   lr_patience: 2
   lr_factor: 0.5
   weight_decay: 0.0

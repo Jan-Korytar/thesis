@@ -59,7 +59,13 @@ def load_config(path: str | Path) -> dict[str, Any]:
         cfg["training"]["lr_patience"] = 2
     if "lr_factor" not in cfg["training"]:
         cfg["training"]["lr_factor"] = 0.5
+    if "lr_scheduler" not in cfg["training"]:
+        cfg["training"]["lr_scheduler"] = "cosine"
 
+    valid_schedulers = ("cosine", "step", "warm_restarts")
+    assert cfg["training"]["lr_scheduler"].lower() in valid_schedulers, (
+        f"Unknown lr_scheduler '{cfg['training']['lr_scheduler']}'. Choose from {valid_schedulers}"
+    )
     assert "batch_size" in cfg["training"]
 
     if "mode" not in cfg:

@@ -20,6 +20,19 @@ PARAM_NAMES = [
 ]
 
 
+_LEGG_CACHE: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_quad_nodes(n_quad: int, u_max: float, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (n_quad, device)
+    if key not in _LEGG_CACHE:
+        nodes, weights = np.polynomial.legendre.leggauss(n_quad)
+        nodes_t = torch.as_tensor(0.5 * u_max * (nodes + 1.0), dtype=dtype, device=device).unsqueeze(0)
+        weights_t = torch.as_tensor(0.5 * u_max * weights, dtype=dtype, device=device).unsqueeze(0)
+        _LEGG_CACHE[key] = (nodes_t, weights_t)
+    return _LEGG_CACHE[key]
+
+
 def price_bates_call(x: torch.Tensor, n_quad: int = 128, chunk_size: int = 32768) -> torch.Tensor:
     assert x.ndim == 2
     assert x.shape[1] == 13
@@ -46,9 +59,7 @@ def _price_bates_chunk(x: torch.Tensor, n_quad: int) -> torch.Tensor:
     prob = x[:, 12].to(dtype).unsqueeze(-1)
 
     u_max = 80.0
-    nodes, weights = np.polynomial.legendre.leggauss(n_quad)
-    nodes_t = torch.as_tensor(0.5 * u_max * (nodes + 1.0), dtype=dtype, device=device).unsqueeze(0)
-    weights_t = torch.as_tensor(0.5 * u_max * weights, dtype=dtype, device=device).unsqueeze(0)
+    nodes_t, weights_t = _get_quad_nodes(n_quad, u_max, device, dtype)
 
     k_over_s = torch.exp(-m_val)
     k_log = torch.log(k_over_s)
@@ -105,7 +116,7 @@ def invert_bsiv(
     tau: torch.Tensor,
     r: torch.Tensor,
     q: torch.Tensor,
-    max_iter: int = 25,
+    max_iter: int = 20,
     tol: float = 1e-5,
 ) -> torch.Tensor:
     k = torch.exp(-m)
@@ -114,21 +125,22 @@ def invert_bsiv(
     valid = (price > lower + 1e-5) & (price < upper - 1e-5)
 
     sigma = torch.clamp(torch.sqrt(2.0 * np.pi / tau) * price, min=0.05, max=2.0)
+    sqrt_tau = torch.sqrt(tau)
+    inv_sqrt_2pi = 1.0 / np.sqrt(2.0 * np.pi)
+    disc_q = torch.exp(-q * tau)
+
     for _ in range(max_iter):
         p_guess = bs_call_price(m, tau, r, q, sigma)
         diff = p_guess - price
 
-        sqrt_tau = torch.sqrt(tau)
         d1 = (m + (r - q + 0.5 * sigma**2) * tau) / (sigma * sqrt_tau)
-        vega = torch.exp(-q * tau) * sqrt_tau * (1.0 / np.sqrt(2.0 * np.pi)) * torch.exp(-0.5 * d1**2)
-        vega = torch.clamp(vega, min=1e-8)
+        vega = torch.clamp(disc_q * sqrt_tau * inv_sqrt_2pi * torch.exp(-0.5 * d1**2), min=1e-8)
 
-        step = diff / vega
-        sigma = torch.clamp(sigma - step, min=0.001, max=5.0)
-        if torch.max(torch.abs(diff[valid])) < tol:
-            break
+        sigma = torch.clamp(sigma - diff / vega, min=0.001, max=5.0)
 
-    sigma[~valid] = float("nan")
+    p_final = bs_call_price(m, tau, r, q, sigma)
+    converged = valid & (torch.abs(p_final - price) < 1e-3)
+    sigma[~converged] = float("nan")
     return sigma
 
 
@@ -139,12 +151,14 @@ def sample_parameters(
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
     assert n_samples > 0
-    generator = torch.Generator(device="cpu").manual_seed(seed) if seed is not None else None
+    dev = torch.device(device)
+    gen_dev = dev.type if dev.type == "cuda" else "cpu"
+    generator = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
 
-    lows = torch.tensor([bounds[name][0] for name in PARAM_NAMES], dtype=torch.float32)
-    highs = torch.tensor([bounds[name][1] for name in PARAM_NAMES], dtype=torch.float32)
-    u = torch.rand(n_samples, len(PARAM_NAMES), generator=generator)
-    features = (lows + u * (highs - lows)).to(device)
+    lows = torch.tensor([bounds[name][0] for name in PARAM_NAMES], dtype=torch.float32, device=dev)
+    highs = torch.tensor([bounds[name][1] for name in PARAM_NAMES], dtype=torch.float32, device=dev)
+    u = torch.rand((n_samples, len(PARAM_NAMES)), generator=generator, dtype=torch.float32, device=dev)
+    features = lows + u * (highs - lows)
     assert features.shape == (n_samples, 13)
     return features
 

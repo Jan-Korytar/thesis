@@ -45,13 +45,13 @@ def cosine_with_warmup(epochs: int, warmup: int, floor: float = 0.01):
 
 def suggest(trial: optuna.Trial) -> dict[str, Any]:
     return {
-        "n_layers": trial.suggest_int("n_layers", 3, 6),
+        "n_layers": trial.suggest_int("n_layers", 4, 6),
         "width": trial.suggest_categorical("width", [256, 384, 512, 768, 1024]),
-        "activation": trial.suggest_categorical("activation", ["silu", "gelu", "tanh"]),
-        "dropout_rate": trial.suggest_float("dropout_rate", 0.02, 0.10, step=0.02),
-        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
-        "weight_decay": trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [1024, 2048, 4096, 8192]),
+        "activation": trial.suggest_categorical("activation", ["silu", "gelu", "selu", "tanh"]),
+        "dropout_rate": trial.suggest_float("dropout_rate", 0.0, 0.05, step=0.01),
+        "learning_rate": trial.suggest_float("learning_rate", 5e-5, 2e-3, log=True),
+        "weight_decay": trial.suggest_categorical("weight_decay", [0.0, 1e-7, 1e-6, 1e-5]),
+        "batch_size": trial.suggest_categorical("batch_size", [256, 512, 1024, 2048]),
     }
 
 
@@ -99,8 +99,40 @@ def objective(trial: optuna.Trial, cfg: dict[str, Any], bench: Benchmark, device
             raise optuna.TrialPruned()
 
     trial.set_user_attr("seconds", time.time() - t0)
-    print(f"[Trial {trial.number:03d}] val={best_val:.6f} | params={n_params / 1e6:.2f}M | {time.time() - t0:.1f}s | {p}")
+    print(
+        f"[{device} | Trial {trial.number:03d}] val={best_val:.6f} | params={n_params / 1e6:.2f}M | {time.time() - t0:.1f}s | {p}"
+    )
     return best_val
+
+
+def build_study(opt_cfg: dict[str, Any], seed: int) -> optuna.Study:
+    storage_path = Path(opt_cfg["storage"])
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    storage = JournalStorage(JournalFileBackend(str(storage_path), lock_obj=JournalFileOpenLock(str(storage_path))))
+    return optuna.create_study(
+        study_name=opt_cfg["study_name"],
+        storage=storage,
+        direction="minimize",
+        load_if_exists=True,
+        sampler=optuna.samplers.TPESampler(
+            multivariate=True, group=True, n_startup_trials=opt_cfg["startup_trials"], seed=seed
+        ),
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=opt_cfg["startup_trials"],
+            n_warmup_steps=opt_cfg["prune_warmup_reports"] * opt_cfg["report_every"],
+        ),
+    )
+
+
+def run_worker(rank: int, cfg: dict[str, Any], device_str: str) -> None:
+    device = torch.device(device_str)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    opt_cfg = cfg["optuna"]
+    study = build_study(opt_cfg, seed=cfg["seed"] + rank)
+    bench = Benchmark(cfg, device)
+    stop_at_total = optuna.study.MaxTrialsCallback(opt_cfg["n_trials"], states=(TrialState.COMPLETE, TrialState.PRUNED))
+    study.optimize(lambda t: objective(t, cfg, bench, device), callbacks=[stop_at_total])
 
 
 def export_best(study: optuna.Study, cfg: dict[str, Any], out_cfg: str, out_model_cfg: str) -> None:
@@ -136,6 +168,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/base_config.yaml")
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--n-gpus", type=int, default=0, help="0 = auto-use all available GPUs in parallel")
     parser.add_argument("--export-only", action="store_true")
     parser.add_argument("--out-config", type=str, default="configs/tuned_config.yaml")
     parser.add_argument("--out-model-config", type=str, default="configs/model/mlp_tuned.yaml")
@@ -143,28 +176,26 @@ def main() -> None:
 
     cfg = load_config(args.config)
     opt_cfg = cfg["optuna"]
-    device = resolve_device(args.device or cfg["device"])
-
-    storage_path = Path(opt_cfg["storage"])
-    storage_path.parent.mkdir(parents=True, exist_ok=True)
-    storage = JournalStorage(JournalFileBackend(str(storage_path), lock_obj=JournalFileOpenLock(str(storage_path))))
-    study = optuna.create_study(
-        study_name=opt_cfg["study_name"],
-        storage=storage,
-        direction="minimize",
-        load_if_exists=True,
-        sampler=optuna.samplers.TPESampler(multivariate=True, group=True, n_startup_trials=opt_cfg["startup_trials"]),
-        pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=opt_cfg["startup_trials"],
-            n_warmup_steps=opt_cfg["prune_warmup_reports"] * opt_cfg["report_every"],
-        ),
-    )
 
     if not args.export_only:
-        bench = Benchmark(cfg, device)
-        stop_at_total = optuna.study.MaxTrialsCallback(opt_cfg["n_trials"], states=(TrialState.COMPLETE, TrialState.PRUNED))
-        study.optimize(lambda t: objective(t, cfg, bench, device), callbacks=[stop_at_total])
+        avail_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        n_gpus = args.n_gpus if args.n_gpus > 0 else avail_gpus
 
+        if args.device is None and n_gpus > 1:
+            print(f"[Optuna Multi-GPU] Launching {n_gpus} parallel trial workers across cuda:0..cuda:{n_gpus - 1}")
+            ctx = torch.multiprocessing.get_context("spawn")
+            procs = []
+            for rank in range(n_gpus):
+                p = ctx.Process(target=run_worker, args=(rank, cfg, f"cuda:{rank}"))
+                p.start()
+                procs.append(p)
+            for p in procs:
+                p.join()
+        else:
+            device = resolve_device(args.device or cfg["device"])
+            run_worker(0, cfg, str(device))
+
+    study = build_study(opt_cfg, seed=cfg["seed"])
     export_best(study, cfg, args.out_config, args.out_model_config)
 
 

@@ -23,6 +23,7 @@ class SurrogateMLP(nn.Module):
             "gelu": nn.GELU,
             "relu": nn.ReLU,
             "tanh": nn.Tanh,
+            "selu": nn.SELU,
         }
         act_cls = activations[activation.lower()]
 

@@ -62,10 +62,10 @@ active:
 optuna:
   study_name: "bsiv_arch_v1"
   storage: "optuna/bsiv_arch_v1.journal"
-  n_trials: 80
+  n_trials: 60
   train_samples: 80000
   val_samples: 50000
-  epochs: 60
+  epochs: 50
   warmup_epochs: 3
   report_every: 3
   prune_warmup_reports: 4

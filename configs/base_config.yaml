@@ -57,16 +57,17 @@ active:
   early_stopping_patience: 5
   curvature_weight: 1.0
 
-# Stage 1: architecture + optimizer search on a fixed GPU-cached dataset sized like the final label budget.
-# val_samples=50k gives ~0.45% relative standard error on the MAE, enough to rank trials 1-2% apart.
+# Stage 1: Full Active Learning + Architecture + Scheduler search on pre-cached GPU candidate pools.
+# Pre-pricing the per-round pools once in VRAM gives zero FFT/BSIV solver overhead during trials.
 optuna:
-  study_name: "bsiv_arch_v1"
-  storage: "optuna/bsiv_arch_v1.journal"
+  study_name: "bsiv_active_v2"
+  storage: "optuna/bsiv_active_v2.journal"
   n_trials: 60
-  train_samples: 80000
+  initial_samples: 30000
   val_samples: 50000
-  epochs: 50
-  warmup_epochs: 3
-  report_every: 3
-  prune_warmup_reports: 4
+  rounds: 5
+  pool_size: 20000
+  query_size: 6000
+  mc_passes: 10
+  prune_warmup_rounds: 2
   startup_trials: 10

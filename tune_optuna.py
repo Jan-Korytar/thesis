@@ -277,18 +277,124 @@ def build_study(study_name: str, storage_file: str, startup_trials: int, warmup_
     )
 
 
+def count_finished_trials(study: optuna.Study) -> int:
+    return sum(1 for t in study.trials if t.state in (TrialState.COMPLETE, TrialState.PRUNED))
+
+
+def clear_storage_if_fresh(storage_file: str) -> None:
+    p = Path(storage_file)
+    for candidate in [p, Path(f"{storage_file}.lock")]:
+        if candidate.is_file():
+            candidate.unlink()
+            print(f"[Fresh Start] Removed existing journal file: {candidate}")
+
+
+def save_study_plots(study: optuna.Study, stage_tag: str, out_dir: str = "optuna/plots") -> None:
+    completed = [t for t in study.trials if t.state == TrialState.COMPLETE and t.value is not None]
+    if not completed:
+        print(f"[Visualize] No completed trials yet for {stage_tag}; skipping plots.")
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_dir = Path(out_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Optimization History Plot (Trial Values + Running Best)
+    nums = [t.number for t in completed]
+    vals = [t.value * 1e4 for t in completed]  # in bps
+    best_so_far = []
+    cur_best = float("inf")
+    for v in vals:
+        cur_best = min(cur_best, v)
+        best_so_far.append(cur_best)
+
+    fig, ax = plt.subplots(figsize=(9, 5), dpi=150)
+    ax.scatter(nums, vals, alpha=0.65, label="Completed Trial (bps)")
+    ax.plot(nums, best_so_far, color="crimson", linewidth=2.0, label="Best So Far (bps)")
+    ax.set_title(f"Optuna Optimization History — {stage_tag}")
+    ax.set_xlabel("Trial Number")
+    ax.set_ylabel("Validation BSIV MAE (bps)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    hist_path = plot_dir / f"{stage_tag}_history.png"
+    fig.savefig(hist_path)
+    plt.close(fig)
+
+    # 2. Hyperparameter Importance Bar Chart
+    if len(completed) >= 4:
+        try:
+            importances = optuna.importance.get_param_importances(study)
+            if importances:
+                names = list(importances.keys())[::-1]
+                scores = [importances[k] for k in names]
+                fig, ax = plt.subplots(figsize=(8, 5), dpi=150)
+                ax.barh(names, scores, color="steelblue")
+                ax.set_title(f"Hyperparameter Importance — {stage_tag}")
+                ax.set_xlabel("Relative Importance")
+                ax.grid(True, axis="x", alpha=0.3)
+                fig.tight_layout()
+                imp_path = plot_dir / f"{stage_tag}_importances.png"
+                fig.savefig(imp_path)
+                plt.close(fig)
+        except Exception as e:
+            print(f"[Visualize] Could not compute importances for {stage_tag}: {e}")
+
+    # 3. Parameter Slice / Marginal Effect Subplots
+    param_keys = list(completed[0].params.keys())
+    n_p = len(param_keys)
+    cols = min(3, n_p)
+    rows = math.ceil(n_p / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), dpi=150)
+    axes_flat = [axes] if n_p == 1 else list(axes.flat)
+
+    for idx, pk in enumerate(param_keys):
+        ax = axes_flat[idx]
+        x_vals = [t.params[pk] for t in completed if pk in t.params]
+        y_vals = [t.value * 1e4 for t in completed if pk in t.params]
+        if isinstance(x_vals[0], str):
+            cats = sorted(set(x_vals))
+            cat_to_idx = {c: i for i, c in enumerate(cats)}
+            ax.scatter([cat_to_idx[c] for c in x_vals], y_vals, alpha=0.6)
+            ax.set_xticks(range(len(cats)))
+            ax.set_xticklabels(cats, rotation=25, ha="right")
+        else:
+            ax.scatter(x_vals, y_vals, alpha=0.6)
+            if pk in ("learning_rate", "curvature_weight"):
+                ax.set_xscale("log")
+        ax.set_title(pk)
+        ax.set_ylabel("Val MAE (bps)")
+        ax.grid(True, alpha=0.3)
+
+    for idx in range(n_p, len(axes_flat)):
+        axes_flat[idx].axis("off")
+
+    fig.suptitle(f"Parameter Slice Plots — {stage_tag}", y=1.01)
+    fig.tight_layout()
+    slice_path = plot_dir / f"{stage_tag}_slice.png"
+    fig.savefig(slice_path, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"[Visualize] Saved plots to {plot_dir}/ ({stage_tag}_history.png, {stage_tag}_importances.png, {stage_tag}_slice.png)")
+
+
 def run_stage1_worker(rank: int, cfg: dict[str, Any], device_str: str) -> None:
     device = torch.device(device_str)
     if device.type == "cuda":
         torch.cuda.set_device(device)
     opt_cfg = cfg["optuna"]
     study = build_study(
-        study_name=f"{opt_cfg['study_name']}_stage1_arch",
-        storage_file=opt_cfg["storage"],
+        study_name=opt_cfg["stage1_study_name"],
+        storage_file=opt_cfg["stage1_storage"],
         startup_trials=opt_cfg["startup_trials"],
         warmup_steps=opt_cfg["stage1_prune_warmup_reports"] * opt_cfg["stage1_report_every"],
         seed=cfg["seed"] + rank,
     )
+    if count_finished_trials(study) >= opt_cfg["stage1_trials"]:
+        return
     bench = PassiveBenchmark(cfg, device)
     stop_cb = optuna.study.MaxTrialsCallback(opt_cfg["stage1_trials"], states=(TrialState.COMPLETE, TrialState.PRUNED))
     study.optimize(lambda t: objective_stage1(t, cfg, bench, device), callbacks=[stop_cb])
@@ -300,12 +406,14 @@ def run_stage2_worker(rank: int, cfg: dict[str, Any], device_str: str) -> None:
         torch.cuda.set_device(device)
     opt_cfg = cfg["optuna"]
     study = build_study(
-        study_name=f"{opt_cfg['study_name']}_stage2_active",
-        storage_file=opt_cfg["storage"],
+        study_name=opt_cfg["stage2_study_name"],
+        storage_file=opt_cfg["stage2_storage"],
         startup_trials=opt_cfg["startup_trials"],
         warmup_steps=opt_cfg["stage2_prune_warmup_rounds"],
         seed=cfg["seed"] + 100 + rank,
     )
+    if count_finished_trials(study) >= opt_cfg["stage2_trials"]:
+        return
     bench = ActiveBudgetBenchmark(cfg, device)
     stop_cb = optuna.study.MaxTrialsCallback(opt_cfg["stage2_trials"], states=(TrialState.COMPLETE, TrialState.PRUNED))
     study.optimize(lambda t: objective_stage2(t, cfg, bench, device), callbacks=[stop_cb])
@@ -394,6 +502,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/base_config.yaml")
     parser.add_argument("--stage", type=str, choices=["1", "2", "both"], default="both")
+    parser.add_argument("--fresh", action="store_true", help="Delete existing Optuna journal(s) for the selected stage(s) and start fresh")
+    parser.add_argument("--plot-only", action="store_true", help="Generate visualization plots from existing journals without running trials")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--n-gpus", type=int, default=0, help="0 = auto-use all available GPUs in parallel")
     parser.add_argument("--export-only", action="store_true")
@@ -405,32 +515,64 @@ def main() -> None:
     opt_cfg = cfg["optuna"]
 
     if args.stage in ("1", "both"):
-        if not args.export_only:
-            print("=== OPTUNA STAGE 1: ARCHITECTURE + OPTIMIZER + LR SCHEDULER SEARCH ===")
-            run_parallel_or_single(run_stage1_worker, cfg, args)
+        if args.fresh:
+            clear_storage_if_fresh(opt_cfg["stage1_storage"])
         study1 = build_study(
-            study_name=f"{opt_cfg['study_name']}_stage1_arch",
-            storage_file=opt_cfg["storage"],
+            study_name=opt_cfg["stage1_study_name"],
+            storage_file=opt_cfg["stage1_storage"],
             startup_trials=opt_cfg["startup_trials"],
             warmup_steps=opt_cfg["stage1_prune_warmup_reports"] * opt_cfg["stage1_report_every"],
             seed=cfg["seed"],
         )
-        cfg = apply_stage1_best(study1, cfg, args.out_config, args.out_model_config)
+        done1 = count_finished_trials(study1)
+        target1 = opt_cfg["stage1_trials"]
+        if not args.export_only and not args.plot_only:
+            if done1 >= target1:
+                print(f"=== OPTUNA STAGE 1: Already completed ({done1}/{target1} trials). Skipping to export. ===")
+            else:
+                print(f"=== OPTUNA STAGE 1: Resuming at {done1}/{target1} trials ({target1 - done1} remaining) ===")
+                run_parallel_or_single(run_stage1_worker, cfg, args)
+                study1 = build_study(
+                    study_name=opt_cfg["stage1_study_name"],
+                    storage_file=opt_cfg["stage1_storage"],
+                    startup_trials=opt_cfg["startup_trials"],
+                    warmup_steps=opt_cfg["stage1_prune_warmup_reports"] * opt_cfg["stage1_report_every"],
+                    seed=cfg["seed"],
+                )
+        save_study_plots(study1, "stage1_arch")
+        if not args.plot_only:
+            cfg = apply_stage1_best(study1, cfg, args.out_config, args.out_model_config)
 
     if args.stage in ("2", "both"):
+        if args.fresh:
+            clear_storage_if_fresh(opt_cfg["stage2_storage"])
         if args.stage == "2" and Path(args.out_config).is_file():
             cfg = load_config(args.out_config)
-        if not args.export_only:
-            print("=== OPTUNA STAGE 2: ACTIVE LEARNING STRATEGY & LOOP STRUCTURE SEARCH ===")
-            run_parallel_or_single(run_stage2_worker, cfg, args)
         study2 = build_study(
-            study_name=f"{opt_cfg['study_name']}_stage2_active",
-            storage_file=opt_cfg["storage"],
+            study_name=opt_cfg["stage2_study_name"],
+            storage_file=opt_cfg["stage2_storage"],
             startup_trials=opt_cfg["startup_trials"],
             warmup_steps=opt_cfg["stage2_prune_warmup_rounds"],
             seed=cfg["seed"] + 100,
         )
-        apply_stage2_best(study2, cfg, args.out_config)
+        done2 = count_finished_trials(study2)
+        target2 = opt_cfg["stage2_trials"]
+        if not args.export_only and not args.plot_only:
+            if done2 >= target2:
+                print(f"=== OPTUNA STAGE 2: Already completed ({done2}/{target2} trials). Skipping to export. ===")
+            else:
+                print(f"=== OPTUNA STAGE 2: Resuming at {done2}/{target2} trials ({target2 - done2} remaining) ===")
+                run_parallel_or_single(run_stage2_worker, cfg, args)
+                study2 = build_study(
+                    study_name=opt_cfg["stage2_study_name"],
+                    storage_file=opt_cfg["stage2_storage"],
+                    startup_trials=opt_cfg["startup_trials"],
+                    warmup_steps=opt_cfg["stage2_prune_warmup_rounds"],
+                    seed=cfg["seed"] + 100,
+                )
+        save_study_plots(study2, "stage2_active")
+        if not args.plot_only:
+            apply_stage2_best(study2, cfg, args.out_config)
 
 
 if __name__ == "__main__":

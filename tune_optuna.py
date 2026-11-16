@@ -28,19 +28,40 @@ from train import (
 from utils.config_parser import load_config
 
 
-class ActiveBenchmark:
-    """Pre-generates initial training set, validation set, and per-round candidate pools in VRAM.
-    Pre-pricing candidate pools once means trials pay zero FFT/BSIV solver cost when acquiring samples.
+class PassiveBenchmark:
+    """Stage 1 Benchmark: Fixed difficulty-weighted training + validation set in VRAM for pure architecture/scheduler search."""
+
+    def __init__(self, cfg: dict[str, Any], device: torch.device) -> None:
+        opt_cfg = cfg["optuna"]
+        bounds = cfg["data"]["bounds"]
+        t0 = time.time()
+        x_tr, self.y_train = generate_bates_bsiv_data(
+            bounds, opt_cfg["stage1_train_samples"], seed=cfg["seed"] + 10, device=device
+        )
+        x_va, self.y_val = generate_bates_bsiv_data(
+            get_val_bounds(bounds), opt_cfg["val_samples"], seed=cfg["seed"] + 11, device=device
+        )
+        self.x_train = normalize_features(x_tr, bounds)
+        self.x_val = normalize_features(x_va, bounds)
+        print(
+            f"[Stage 1 Benchmark] train={len(self.x_train)} | val={len(self.x_val)} cached on {device} in {time.time() - t0:.1f}s"
+        )
+
+
+class ActiveBudgetBenchmark:
+    """Stage 2 Benchmark: Pre-generates 50k initial set, 100k validation set, and 8x40k candidate pools in VRAM.
+    Pre-pricing candidate pools once means trials pay zero FFT/BSIV solver cost during active acquisition.
     """
 
     def __init__(self, cfg: dict[str, Any], device: torch.device) -> None:
         opt_cfg = cfg["optuna"]
         bounds = cfg["data"]["bounds"]
         self.bounds = bounds
+        self.rounds = opt_cfg["stage2_rounds"]
         t0 = time.time()
 
-        self.x_init_raw, self.y_init = generate_bates_bsiv_data(
-            bounds, opt_cfg["initial_samples"], seed=cfg["seed"] + 10, device=device
+        self.x_init_master, self.y_init_master = generate_bates_bsiv_data(
+            bounds, opt_cfg["stage2_initial_samples"], seed=cfg["seed"] + 20, device=device
         )
         x_va_raw, self.y_val = generate_bates_bsiv_data(
             get_val_bounds(bounds), opt_cfg["val_samples"], seed=cfg["seed"] + 11, device=device
@@ -50,52 +71,38 @@ class ActiveBenchmark:
         self.pools_raw: list[torch.Tensor] = []
         self.pools_norm: list[torch.Tensor] = []
         self.pools_y: list[torch.Tensor] = []
-        for r in range(1, opt_cfg["rounds"] + 1):
+        for r in range(1, self.rounds + 1):
             xp_raw, yp = generate_bates_bsiv_data(
-                bounds, opt_cfg["pool_size"], seed=cfg["seed"] + 100 * r, device=device
+                bounds, opt_cfg["stage2_pool_size"], seed=cfg["seed"] + 100 * r, device=device
             )
             self.pools_raw.append(xp_raw)
             self.pools_norm.append(normalize_features(xp_raw, bounds))
             self.pools_y.append(yp)
 
-        total_pool = sum(len(p) for p in self.pools_raw)
         print(
-            f"[ActiveBenchmark] init={len(self.x_init_raw)} | val={len(self.x_val_norm)} | "
-            f"pools={opt_cfg['rounds']}x (~{total_pool} total) cached on {device} in {time.time() - t0:.1f}s"
+            f"[Stage 2 Benchmark] init={len(self.x_init_master)} | val={len(self.x_val_norm)} | "
+            f"pools={self.rounds}x{opt_cfg['stage2_pool_size']} cached on {device} in {time.time() - t0:.1f}s"
         )
 
 
-def suggest(trial: optuna.Trial) -> dict[str, Any]:
+def suggest_stage1(trial: optuna.Trial) -> dict[str, Any]:
     return {
-        # Architecture
         "n_layers": trial.suggest_int("n_layers", 4, 6),
         "width": trial.suggest_categorical("width", [256, 384, 512, 768, 1024]),
         "activation": trial.suggest_categorical("activation", ["silu", "gelu", "selu", "tanh"]),
-        "dropout_rate": trial.suggest_float("dropout_rate", 0.01, 0.05, step=0.01),
-        # Optimizer & Scheduler
+        "dropout_rate": trial.suggest_float("dropout_rate", 0.01, 0.04, step=0.01),
         "lr_scheduler": trial.suggest_categorical("lr_scheduler", ["cosine", "step", "warm_restarts"]),
-        "learning_rate": trial.suggest_float("learning_rate", 5e-5, 2e-3, log=True),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 6e-4, log=True),
         "weight_decay": trial.suggest_categorical("weight_decay", [0.0, 1e-7, 1e-6, 1e-5]),
-        "batch_size": trial.suggest_categorical("batch_size", [256, 512, 1024, 2048]),
-        # Active Learning
-        "acquisition_strategy": trial.suggest_categorical(
-            "acquisition_strategy",
-            ["uncertainty", "grad_norm", "vega_uncertainty", "delta_variance", "ema", "curvature"],
-        ),
-        "uniform_ratio": trial.suggest_float("uniform_ratio", 0.10, 0.40, step=0.05),
-        "curvature_weight": trial.suggest_float("curvature_weight", 0.25, 2.0, log=True),
-        "epochs_per_round": trial.suggest_categorical("epochs_per_round", [10, 15, 20, 25]),
+        "batch_size": trial.suggest_categorical("batch_size", [256, 512, 1024]),
     }
 
 
-def objective(trial: optuna.Trial, cfg: dict[str, Any], bench: ActiveBenchmark, device: torch.device) -> float:
-    p = suggest(trial)
+def objective_stage1(trial: optuna.Trial, cfg: dict[str, Any], bench: PassiveBenchmark, device: torch.device) -> float:
+    p = suggest_stage1(trial)
     opt_cfg = cfg["optuna"]
-    rounds = opt_cfg["rounds"]
-    epochs_per_round = p["epochs_per_round"]
-    query_size = opt_cfg["query_size"]
-    mc_passes = opt_cfg["mc_passes"]
-    eval_batch_size = cfg["training"]["eval_batch_size"]
+    epochs = opt_cfg["stage1_epochs"]
+    report_every = opt_cfg["stage1_report_every"]
 
     trial_cfg = copy.deepcopy(cfg)
     trial_cfg["model"]["hidden_layers"] = [p["width"]] * p["n_layers"]
@@ -108,11 +115,75 @@ def objective(trial: optuna.Trial, cfg: dict[str, Any], bench: ActiveBenchmark, 
 
     set_seed(cfg["seed"])
     model = build_model(trial_cfg).to(device)
+    optimizer = build_optimizer(model, p["learning_rate"], p["weight_decay"], device)
+    scheduler = build_scheduler(optimizer, trial_cfg, total_epochs=epochs)
+
+    use_amp = cfg["training"]["use_amp"] and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    criterion = BSIVLoss()
+
+    train_loader = create_dataloader(bench.x_train, bench.y_train, batch_size=p["batch_size"], shuffle=True, device=device)
+    val_loader = create_dataloader(
+        bench.x_val, bench.y_val, batch_size=cfg["training"]["eval_batch_size"], shuffle=False, device=device
+    )
+
+    n_params = sum(t.numel() for t in model.parameters())
+    trial.set_user_attr("n_params", n_params)
+    t0 = time.time()
+    best_val = float("inf")
+
+    for epoch in range(1, epochs + 1):
+        run_epoch(model, train_loader, criterion, optimizer, device, scaler=scaler, use_amp=use_amp)
+        scheduler.step()
+        if epoch % report_every != 0 and epoch != epochs:
+            continue
+
+        val_loss = run_epoch(model, val_loader, criterion, None, device)
+        if not math.isfinite(val_loss):
+            raise optuna.TrialPruned()
+        best_val = min(best_val, val_loss)
+        trial.report(val_loss, step=epoch)
+        if trial.should_prune():
+            trial.set_user_attr("seconds", time.time() - t0)
+            raise optuna.TrialPruned()
+
+    trial.set_user_attr("seconds", time.time() - t0)
+    print(
+        f"[Stage 1 | {device} | Trial {trial.number:03d}] val={best_val:.6f} | "
+        f"params={n_params / 1e6:.2f}M | {time.time() - t0:.1f}s | {p}"
+    )
+    return best_val
+
+
+def suggest_stage2(trial: optuna.Trial) -> dict[str, Any]:
+    return {
+        "acquisition_strategy": trial.suggest_categorical(
+            "acquisition_strategy",
+            ["uncertainty", "grad_norm", "vega_uncertainty", "delta_variance", "ema", "curvature"],
+        ),
+        "uniform_ratio": trial.suggest_float("uniform_ratio", 0.15, 0.45, step=0.05),
+        "curvature_weight": trial.suggest_float("curvature_weight", 0.15, 1.50, log=True),
+        "epochs_per_round": trial.suggest_categorical("epochs_per_round", [10, 15, 20]),
+    }
+
+
+def objective_stage2(trial: optuna.Trial, cfg: dict[str, Any], bench: ActiveBudgetBenchmark, device: torch.device) -> float:
+    p = suggest_stage2(trial)
+    opt_cfg = cfg["optuna"]
+    rounds = opt_cfg["stage2_rounds"]
+    query_size = opt_cfg["stage2_query_size"]
+    epochs_per_round = p["epochs_per_round"]
+    mc_passes = opt_cfg["mc_passes"]
+    eval_batch_size = cfg["training"]["eval_batch_size"]
+    batch_size = cfg["training"]["batch_size"]
+
+    set_seed(cfg["seed"])
+    model = build_model(cfg).to(device)
     ema_model = copy.deepcopy(model).eval() if p["acquisition_strategy"] == "ema" else None
 
     total_epochs = (rounds + 1) * epochs_per_round
-    optimizer = build_optimizer(model, p["learning_rate"], p["weight_decay"], device)
-    scheduler = build_scheduler(optimizer, trial_cfg, total_epochs=total_epochs)
+    optimizer = build_optimizer(model, cfg["training"]["learning_rate"], cfg["training"]["weight_decay"], device)
+    scheduler = build_scheduler(optimizer, cfg, total_epochs=total_epochs)
 
     use_amp = cfg["training"]["use_amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -120,17 +191,15 @@ def objective(trial: optuna.Trial, cfg: dict[str, Any], bench: ActiveBenchmark, 
 
     val_loader = create_dataloader(bench.x_val_norm, bench.y_val, batch_size=eval_batch_size, shuffle=False, device=device)
 
-    x_train_raw = bench.x_init_raw.clone()
-    y_train = bench.y_init.clone()
+    x_train_raw = bench.x_init_master.clone()
+    y_train = bench.y_init_master.clone()
     x_train_norm = normalize_features(x_train_raw, bench.bounds)
-    train_loader = create_dataloader(x_train_norm, y_train, batch_size=p["batch_size"], shuffle=True, device=device)
+    train_loader = create_dataloader(x_train_norm, y_train, batch_size=batch_size, shuffle=True, device=device)
 
-    n_params = sum(t.numel() for t in model.parameters())
-    trial.set_user_attr("n_params", n_params)
     t0 = time.time()
     best_val = float("inf")
 
-    # Round 0: Initial training
+    # Round 0
     for _ in range(epochs_per_round):
         run_epoch(model, train_loader, criterion, optimizer, device, scaler=scaler, use_amp=use_amp)
         if ema_model is not None:
@@ -143,7 +212,7 @@ def objective(trial: optuna.Trial, cfg: dict[str, Any], bench: ActiveBenchmark, 
     best_val = min(best_val, val_loss)
     trial.report(val_loss, step=0)
 
-    # Active Learning Rounds 1..rounds
+    # Active Rounds 1..rounds
     for r in range(1, rounds + 1):
         xp_raw = bench.pools_raw[r - 1]
         xp_norm = bench.pools_norm[r - 1]
@@ -166,7 +235,7 @@ def objective(trial: optuna.Trial, cfg: dict[str, Any], bench: ActiveBenchmark, 
         x_train_raw = torch.cat([x_train_raw, xp_raw[top_indices]], dim=0)
         y_train = torch.cat([y_train, yp[top_indices]], dim=0)
         x_train_norm = normalize_features(x_train_raw, bench.bounds)
-        train_loader = create_dataloader(x_train_norm, y_train, batch_size=p["batch_size"], shuffle=True, device=device)
+        train_loader = create_dataloader(x_train_norm, y_train, batch_size=batch_size, shuffle=True, device=device)
 
         for _ in range(epochs_per_round):
             run_epoch(model, train_loader, criterion, optimizer, device, scaler=scaler, use_amp=use_amp)
@@ -185,43 +254,64 @@ def objective(trial: optuna.Trial, cfg: dict[str, Any], bench: ActiveBenchmark, 
 
     trial.set_user_attr("seconds", time.time() - t0)
     print(
-        f"[{device} | Trial {trial.number:03d}] val={best_val:.6f} | params={n_params / 1e6:.2f}M | "
-        f"{time.time() - t0:.1f}s | strat={p['acquisition_strategy']} | sched={p['lr_scheduler']} | {p}"
+        f"[Stage 2 | {device} | Trial {trial.number:03d}] val={best_val:.6f} | "
+        f"samples={len(x_train_raw)} | {time.time() - t0:.1f}s | {p}"
     )
     return best_val
 
 
-def build_study(opt_cfg: dict[str, Any], seed: int) -> optuna.Study:
-    storage_path = Path(opt_cfg["storage"])
+def build_study(study_name: str, storage_file: str, startup_trials: int, warmup_steps: int, seed: int) -> optuna.Study:
+    storage_path = Path(storage_file)
     storage_path.parent.mkdir(parents=True, exist_ok=True)
     storage = JournalStorage(JournalFileBackend(str(storage_path), lock_obj=JournalFileOpenLock(str(storage_path))))
     return optuna.create_study(
-        study_name=opt_cfg["study_name"],
+        study_name=study_name,
         storage=storage,
         direction="minimize",
         load_if_exists=True,
-        sampler=optuna.samplers.TPESampler(
-            multivariate=True, group=True, n_startup_trials=opt_cfg["startup_trials"], seed=seed
-        ),
+        sampler=optuna.samplers.TPESampler(multivariate=True, n_startup_trials=startup_trials, seed=seed),
         pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=opt_cfg["startup_trials"],
-            n_warmup_steps=opt_cfg["prune_warmup_rounds"],
+            n_startup_trials=startup_trials,
+            n_warmup_steps=warmup_steps,
         ),
     )
 
 
-def run_worker(rank: int, cfg: dict[str, Any], device_str: str) -> None:
+def run_stage1_worker(rank: int, cfg: dict[str, Any], device_str: str) -> None:
     device = torch.device(device_str)
     if device.type == "cuda":
         torch.cuda.set_device(device)
     opt_cfg = cfg["optuna"]
-    study = build_study(opt_cfg, seed=cfg["seed"] + rank)
-    bench = ActiveBenchmark(cfg, device)
-    stop_at_total = optuna.study.MaxTrialsCallback(opt_cfg["n_trials"], states=(TrialState.COMPLETE, TrialState.PRUNED))
-    study.optimize(lambda t: objective(t, cfg, bench, device), callbacks=[stop_at_total])
+    study = build_study(
+        study_name=f"{opt_cfg['study_name']}_stage1_arch",
+        storage_file=opt_cfg["storage"],
+        startup_trials=opt_cfg["startup_trials"],
+        warmup_steps=opt_cfg["stage1_prune_warmup_reports"] * opt_cfg["stage1_report_every"],
+        seed=cfg["seed"] + rank,
+    )
+    bench = PassiveBenchmark(cfg, device)
+    stop_cb = optuna.study.MaxTrialsCallback(opt_cfg["stage1_trials"], states=(TrialState.COMPLETE, TrialState.PRUNED))
+    study.optimize(lambda t: objective_stage1(t, cfg, bench, device), callbacks=[stop_cb])
 
 
-def export_best(study: optuna.Study, cfg: dict[str, Any], out_cfg: str, out_model_cfg: str) -> None:
+def run_stage2_worker(rank: int, cfg: dict[str, Any], device_str: str) -> None:
+    device = torch.device(device_str)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    opt_cfg = cfg["optuna"]
+    study = build_study(
+        study_name=f"{opt_cfg['study_name']}_stage2_active",
+        storage_file=opt_cfg["storage"],
+        startup_trials=opt_cfg["startup_trials"],
+        warmup_steps=opt_cfg["stage2_prune_warmup_rounds"],
+        seed=cfg["seed"] + 100 + rank,
+    )
+    bench = ActiveBudgetBenchmark(cfg, device)
+    stop_cb = optuna.study.MaxTrialsCallback(opt_cfg["stage2_trials"], states=(TrialState.COMPLETE, TrialState.PRUNED))
+    study.optimize(lambda t: objective_stage2(t, cfg, bench, device), callbacks=[stop_cb])
+
+
+def apply_stage1_best(study: optuna.Study, cfg: dict[str, Any], out_cfg: str, out_model_cfg: str) -> dict[str, Any]:
     p = study.best_params
     model_cfg = {
         "model_name": cfg["model"]["model_name"],
@@ -235,30 +325,75 @@ def export_best(study: optuna.Study, cfg: dict[str, Any], out_cfg: str, out_mode
     with open(out_model_cfg, "w", encoding="utf-8") as f:
         yaml.safe_dump(model_cfg, f, sort_keys=False)
 
-    tuned = copy.deepcopy(cfg)
-    tuned.pop("model")
-    tuned["model_config"] = out_model_cfg
-    tuned["training"]["lr_scheduler"] = p["lr_scheduler"]
-    tuned["training"]["learning_rate"] = float(f"{p['learning_rate']:.3e}")
-    tuned["training"]["weight_decay"] = float(f"{p['weight_decay']:.3e}")
-    tuned["training"]["batch_size"] = p["batch_size"]
-    tuned["active"]["acquisition_strategy"] = p["acquisition_strategy"]
-    tuned["active"]["uniform_ratio"] = round(p["uniform_ratio"], 3)
-    tuned["active"]["curvature_weight"] = round(p["curvature_weight"], 4)
-    tuned["active"]["epochs_per_round"] = p["epochs_per_round"]
+    updated = copy.deepcopy(cfg)
+    updated["model"] = copy.deepcopy(model_cfg)
+    updated["model_config"] = out_model_cfg
+    updated["training"]["lr_scheduler"] = p["lr_scheduler"]
+    updated["training"]["learning_rate"] = float(f"{p['learning_rate']:.3e}")
+    updated["training"]["weight_decay"] = float(f"{p['weight_decay']:.3e}")
+    updated["training"]["batch_size"] = p["batch_size"]
 
+    to_save = copy.deepcopy(updated)
+    to_save.pop("model", None)
     with open(out_cfg, "w", encoding="utf-8") as f:
-        yaml.safe_dump(tuned, f, sort_keys=False)
+        yaml.safe_dump(to_save, f, sort_keys=False)
 
-    print(f"\nBest trial #{study.best_trial.number}: val={study.best_value:.6f}")
+    print(f"\n[Stage 1 Winner] Trial #{study.best_trial.number}: val={study.best_value:.6f}")
     for k, v in p.items():
         print(f"  {k}: {v}")
-    print(f"Saved {out_model_cfg} and {out_cfg}")
+    print(f"Saved architecture to {out_model_cfg} and updated {out_cfg}\n")
+    return updated
+
+
+def apply_stage2_best(study: optuna.Study, cfg: dict[str, Any], out_cfg: str) -> None:
+    p = study.best_params
+    updated = copy.deepcopy(cfg)
+    updated.pop("model", None)
+
+    updated["active"]["acquisition_strategy"] = p["acquisition_strategy"]
+    updated["active"]["uniform_ratio"] = round(p["uniform_ratio"], 3)
+    updated["active"]["curvature_weight"] = round(p["curvature_weight"], 4)
+    updated["active"]["epochs_per_round"] = p["epochs_per_round"]
+
+    with open(out_cfg, "w", encoding="utf-8") as f:
+        yaml.safe_dump(updated, f, sort_keys=False)
+
+    full_budget = updated["active"]["initial_samples"] + updated["active"]["rounds"] * updated["active"]["query_size"]
+    print(f"\n[Stage 2 Winner] Trial #{study.best_trial.number}: val={study.best_value:.6f}")
+    for k, v in p.items():
+        print(f"  {k}: {v}")
+    print(
+        f"Preserved Full Marathon Schedule ({full_budget:,} total samples): "
+        f"initial_samples={updated['active']['initial_samples']:,}, "
+        f"rounds={updated['active']['rounds']}, "
+        f"query_size={updated['active']['query_size']:,}"
+    )
+    print(f"Saved final tuned config to {out_cfg}")
+
+
+def run_parallel_or_single(worker_fn, cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    avail_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    n_gpus = args.n_gpus if args.n_gpus > 0 else avail_gpus
+
+    if args.device is None and n_gpus > 1:
+        print(f"[Optuna Multi-GPU] Launching {n_gpus} parallel workers across cuda:0..cuda:{n_gpus - 1}")
+        ctx = torch.multiprocessing.get_context("spawn")
+        procs = []
+        for rank in range(n_gpus):
+            p = ctx.Process(target=worker_fn, args=(rank, cfg, f"cuda:{rank}"))
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join()
+    else:
+        device = resolve_device(args.device or cfg["device"])
+        worker_fn(0, cfg, str(device))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/base_config.yaml")
+    parser.add_argument("--stage", type=str, choices=["1", "2", "both"], default="both")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--n-gpus", type=int, default=0, help="0 = auto-use all available GPUs in parallel")
     parser.add_argument("--export-only", action="store_true")
@@ -269,26 +404,33 @@ def main() -> None:
     cfg = load_config(args.config)
     opt_cfg = cfg["optuna"]
 
-    if not args.export_only:
-        avail_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        n_gpus = args.n_gpus if args.n_gpus > 0 else avail_gpus
+    if args.stage in ("1", "both"):
+        if not args.export_only:
+            print("=== OPTUNA STAGE 1: ARCHITECTURE + OPTIMIZER + LR SCHEDULER SEARCH ===")
+            run_parallel_or_single(run_stage1_worker, cfg, args)
+        study1 = build_study(
+            study_name=f"{opt_cfg['study_name']}_stage1_arch",
+            storage_file=opt_cfg["storage"],
+            startup_trials=opt_cfg["startup_trials"],
+            warmup_steps=opt_cfg["stage1_prune_warmup_reports"] * opt_cfg["stage1_report_every"],
+            seed=cfg["seed"],
+        )
+        cfg = apply_stage1_best(study1, cfg, args.out_config, args.out_model_config)
 
-        if args.device is None and n_gpus > 1:
-            print(f"[Optuna Multi-GPU] Launching {n_gpus} parallel trial workers across cuda:0..cuda:{n_gpus - 1}")
-            ctx = torch.multiprocessing.get_context("spawn")
-            procs = []
-            for rank in range(n_gpus):
-                p = ctx.Process(target=run_worker, args=(rank, cfg, f"cuda:{rank}"))
-                p.start()
-                procs.append(p)
-            for p in procs:
-                p.join()
-        else:
-            device = resolve_device(args.device or cfg["device"])
-            run_worker(0, cfg, str(device))
-
-    study = build_study(opt_cfg, seed=cfg["seed"])
-    export_best(study, cfg, args.out_config, args.out_model_config)
+    if args.stage in ("2", "both"):
+        if args.stage == "2" and Path(args.out_config).is_file():
+            cfg = load_config(args.out_config)
+        if not args.export_only:
+            print("=== OPTUNA STAGE 2: ACTIVE LEARNING STRATEGY & LOOP STRUCTURE SEARCH ===")
+            run_parallel_or_single(run_stage2_worker, cfg, args)
+        study2 = build_study(
+            study_name=f"{opt_cfg['study_name']}_stage2_active",
+            storage_file=opt_cfg["storage"],
+            startup_trials=opt_cfg["startup_trials"],
+            warmup_steps=opt_cfg["stage2_prune_warmup_rounds"],
+            seed=cfg["seed"] + 100,
+        )
+        apply_stage2_best(study2, cfg, args.out_config)
 
 
 if __name__ == "__main__":

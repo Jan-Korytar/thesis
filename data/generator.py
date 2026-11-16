@@ -149,16 +149,24 @@ def sample_parameters(
     n_samples: int,
     seed: int | None = None,
     device: torch.device | str = "cpu",
+    difficulty_weighted_tau: bool = True,
 ) -> torch.Tensor:
     assert n_samples > 0
     dev = torch.device(device)
-    gen_dev = dev.type if dev.type == "cuda" else "cpu"
-    generator = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
+    generator = torch.Generator(device=dev).manual_seed(seed) if seed is not None else None
 
     lows = torch.tensor([bounds[name][0] for name in PARAM_NAMES], dtype=torch.float32, device=dev)
     highs = torch.tensor([bounds[name][1] for name in PARAM_NAMES], dtype=torch.float32, device=dev)
     u = torch.rand((n_samples, len(PARAM_NAMES)), generator=generator, dtype=torch.float32, device=dev)
     features = lows + u * (highs - lows)
+
+    tau_low, tau_high = bounds["maturity_days"]
+    if difficulty_weighted_tau and tau_low > 0.0 and (tau_high / tau_low > 10.0):
+        # Continuous log-uniform sampling: tau = tau_min * (tau_max / tau_min)^u, so p(tau) ~ 1 / tau.
+        # No hardcoded regime cutoffs; sampling density scales continuously with surface Gamma curvature (~ 1/tau).
+        u_tau = u[:, 1]
+        features[:, 1] = tau_low * ((tau_high / tau_low) ** u_tau)
+
     assert features.shape == (n_samples, 13)
     return features
 

@@ -144,7 +144,7 @@ def evaluate_hypercube_streaming(
     while collected < n_samples:
         needed = n_samples - collected
         batch_n = min(max(needed, 16384), chunk_size)
-        x_cand = sample_parameters(bounds, batch_n, seed=cur_seed, device=device)
+        x_cand = sample_parameters(bounds, batch_n, seed=cur_seed, device=device, difficulty_weighted_tau=False)
         cur_seed += 1000
 
         if is_bsiv:
@@ -241,10 +241,14 @@ def evaluate_chen_bin_streaming(
 
         tau_years = x_cand[:, 1] / 365.0
         v_t = x_cand[:, 2]
+        r_rate = x_cand[:, 3]
+        q_div = x_cand[:, 4]
         u_m = torch.rand((batch_n,), generator=gen, dtype=torch.float32, device=device)
         m_tilde = m_norm_range[0] + u_m * (m_norm_range[1] - m_norm_range[0])
 
-        m_log = m_tilde * torch.sqrt(v_t) * torch.sqrt(tau_years)
+        # Eq. (14): m_t = ln(K / F_{t,T}) / (sqrt(tau) * sigma_atm), where F_{t,T} = S_t * exp((r - q) * tau).
+        # Our generator's feature 0 is m_log = ln(S_t / K) = -ln(K / F_{t,T}) - (r - q) * tau.
+        m_log = -m_tilde * torch.sqrt(v_t) * torch.sqrt(tau_years) - (r_rate - q_div) * tau_years
         x_cand[:, 0] = m_log
 
         valid_m = (m_log >= m_low) & (m_log <= m_high)
@@ -319,9 +323,9 @@ def run_chen_12bin_suite(
         ("90 < tau <= 365", (90.0, 365.0)),
     ]
     m_bins = [
-        ("OTM (-9 <= m <= -1.8816)", (-9.0, -1.8816)),
+        ("ITM (-9 <= m <= -1.8816)", (-9.0, -1.8816)),
         ("ATM (-1.8816 < m <= -0.2381)", (-1.8816, -0.2381)),
-        ("ITM (-0.2381 < m <= 5)", (-0.2381, 5.0)),
+        ("OTM (-0.2381 < m <= 5)", (-0.2381, 5.0)),
     ]
 
     total_options = n_bin_samples * 12

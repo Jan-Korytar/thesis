@@ -100,8 +100,9 @@ def compute_pool_delta_variance(
 
 
 def robust_minmax(t: torch.Tensor, q: float = 0.99) -> torch.Tensor:
-    cap = torch.quantile(t.float(), q)
-    clipped = torch.clamp(t.float(), max=cap)
+    clean = torch.nan_to_num(t.float(), nan=0.0, posinf=1e4, neginf=0.0)
+    cap = torch.quantile(clean, q)
+    clipped = torch.clamp(clean, min=0.0, max=cap)
     return (clipped - clipped.min()) / (clipped.max() - clipped.min() + 1e-8)
 
 
@@ -176,7 +177,8 @@ def select_active_samples(
     n_uniform = int(query_size * uniform_ratio)
     n_active = query_size - n_uniform
 
-    probs = (score**2) + 1e-6
+    clean_score = torch.nan_to_num(score.float(), nan=0.0, posinf=1.0, neginf=0.0)
+    probs = torch.clamp(clean_score**2, min=0.0, max=1e6) + 1e-6
     active_indices = torch.multinomial(probs, num_samples=n_active, replacement=False)
 
     if n_uniform > 0:
@@ -189,8 +191,8 @@ def select_active_samples(
     else:
         top_indices = active_indices
 
-    mean_u = uncertainty[top_indices].mean().item()
-    mean_aux = aux_metric[top_indices].mean().item()
+    mean_u = torch.nan_to_num(uncertainty[top_indices], nan=0.0).mean().item()
+    mean_aux = torch.nan_to_num(aux_metric[top_indices], nan=0.0).mean().item()
     return top_indices, mean_u, mean_aux
 
 
@@ -295,10 +297,13 @@ def run_epoch(
             if is_train:
                 if scaler is not None and use_amp:
                     scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
 
             total_loss += loss.detach() * len(bx)

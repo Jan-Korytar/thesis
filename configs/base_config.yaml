@@ -48,26 +48,35 @@ active:
   uniform_ratio: 0.25
   initial_samples: 100000
   rounds: 50
-  query_size: 10000
-  pool_size: 50000
+  query_size: 20000
+  pool_size: 100000
   mc_passes: 20
-  val_samples: 100000
+  val_samples: 200000
   epochs_per_round: 20
   target_val_loss: 0.001
-  early_stopping_patience: 5
+  early_stopping_patience: 10
   curvature_weight: 1.0
 
-# Stage 1: Full Active Learning + Architecture + Scheduler search on pre-cached GPU candidate pools.
-# Pre-pricing the per-round pools once in VRAM gives zero FFT/BSIV solver overhead during trials.
+# Two-Stage Optuna Pipeline:
+# Stage 1 finds a reliable Architecture + Optimizer + LR Scheduler on a 120k-sample difficulty-weighted dataset.
+# Stage 2 locks in Stage 1 and tunes Active Learning strategy on a 150k-sample (50k + 8x12.5k) active trajectory,
+# while preserving the full 1.1M-sample / 50-round marathon schedule for final training.
 optuna:
-  study_name: "bsiv_active_v2"
-  storage: "optuna/bsiv_active_v2.journal"
-  n_trials: 60
-  initial_samples: 30000
-  val_samples: 50000
-  rounds: 5
-  pool_size: 20000
-  query_size: 6000
+  study_name: "bsiv_two_stage_v1"
+  storage: "optuna/bsiv_two_stage_v1.journal"
+  val_samples: 100000
+  startup_trials: 20
+  # Stage 1: Architecture + Optimizer + LR Scheduler
+  stage1_trials: 200
+  stage1_train_samples: 120000
+  stage1_epochs: 45
+  stage1_report_every: 3
+  stage1_prune_warmup_reports: 4
+  # Stage 2: Active Learning Strategy (50k init + 8 rounds * 12.5k query = 150k trajectory)
+  stage2_trials: 200
+  stage2_initial_samples: 50000
+  stage2_rounds: 8
+  stage2_query_size: 12500
+  stage2_pool_size: 40000
   mc_passes: 10
-  prune_warmup_rounds: 2
-  startup_trials: 10
+  stage2_prune_warmup_rounds: 3

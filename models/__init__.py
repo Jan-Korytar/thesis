@@ -16,6 +16,7 @@ def build_model(cfg: dict[str, Any]) -> nn.Module:
         output_dim=model_cfg["output_dim"],
         activation=model_cfg["activation"],
         dropout_rate=model_cfg["dropout_rate"],
+        use_residual=model_cfg.get("use_residual", False),
         model_name=model_name,
     )
 

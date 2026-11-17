@@ -90,6 +90,7 @@ def suggest_stage1(trial: optuna.Trial) -> dict[str, Any]:
         "n_layers": trial.suggest_int("n_layers", 4, 6),
         "width": trial.suggest_categorical("width", [256, 384, 512, 768, 1024]),
         "activation": trial.suggest_categorical("activation", ["silu", "gelu", "selu", "tanh"]),
+        "use_residual": trial.suggest_categorical("use_residual", [True, False]),
         "dropout_rate": trial.suggest_float("dropout_rate", 0.01, 0.04, step=0.01),
         "lr_scheduler": trial.suggest_categorical("lr_scheduler", ["cosine", "step"]),
         "learning_rate": trial.suggest_float("learning_rate", 1e-4, 6e-4, log=True),
@@ -107,6 +108,7 @@ def objective_stage1(trial: optuna.Trial, cfg: dict[str, Any], bench: PassiveBen
     trial_cfg = copy.deepcopy(cfg)
     trial_cfg["model"]["hidden_layers"] = [p["width"]] * p["n_layers"]
     trial_cfg["model"]["activation"] = p["activation"]
+    trial_cfg["model"]["use_residual"] = p["use_residual"]
     trial_cfg["model"]["dropout_rate"] = p["dropout_rate"]
     trial_cfg["training"]["lr_scheduler"] = p["lr_scheduler"]
     trial_cfg["training"]["learning_rate"] = p["learning_rate"]
@@ -355,10 +357,11 @@ def save_study_plots(study: optuna.Study, stage_tag: str, out_dir: str = "optuna
         ax = axes_flat[idx]
         x_vals = [t.params[pk] for t in completed if pk in t.params]
         y_vals = [t.value * 1e4 for t in completed if pk in t.params]
-        if isinstance(x_vals[0], str):
-            cats = sorted(set(x_vals))
+        if isinstance(x_vals[0], (str, bool)):
+            str_vals = [str(v) for v in x_vals]
+            cats = sorted(set(str_vals))
             cat_to_idx = {c: i for i, c in enumerate(cats)}
-            ax.scatter([cat_to_idx[c] for c in x_vals], y_vals, alpha=0.6)
+            ax.scatter([cat_to_idx[c] for c in str_vals], y_vals, alpha=0.6)
             ax.set_xticks(range(len(cats)))
             ax.set_xticklabels(cats, rotation=25, ha="right")
         else:
@@ -426,6 +429,7 @@ def apply_stage1_best(study: optuna.Study, cfg: dict[str, Any], out_cfg: str, ou
         "input_dim": cfg["model"]["input_dim"],
         "hidden_layers": [p["width"]] * p["n_layers"],
         "activation": p["activation"],
+        "use_residual": bool(p["use_residual"]),
         "dropout_rate": round(p["dropout_rate"], 4),
         "output_dim": cfg["model"]["output_dim"],
     }

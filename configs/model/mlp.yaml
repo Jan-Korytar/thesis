@@ -3,4 +3,5 @@ input_dim: 13
 hidden_layers: [256, 512, 512, 512, 512]
 activation: "selu"
 dropout_rate: 0.05
+use_residual: true
 output_dim: 1

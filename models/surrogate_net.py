@@ -2,6 +2,18 @@ import torch
 import torch.nn as nn
 
 
+class ResidualBlock(nn.Module):
+    def __init__(self, dim: int, act_cls: type[nn.Module], dropout_rate: float = 0.0) -> None:
+        super().__init__()
+        layers: list[nn.Module] = [nn.Linear(dim, dim), act_cls()]
+        if dropout_rate > 0.0:
+            layers.append(nn.Dropout(dropout_rate))
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.block(x)
+
+
 class SurrogateMLP(nn.Module):
     def __init__(
         self,
@@ -10,6 +22,7 @@ class SurrogateMLP(nn.Module):
         output_dim: int = 1,
         activation: str = "silu",
         dropout_rate: float = 0.0,
+        use_residual: bool = False,
         model_name: str = "surrogate_mlp",
     ) -> None:
         super().__init__()
@@ -31,16 +44,20 @@ class SurrogateMLP(nn.Module):
         in_dim = input_dim
         for hidden_dim in hidden_layers:
             assert hidden_dim > 0
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(act_cls())
-            if dropout_rate > 0.0:
-                layers.append(nn.Dropout(dropout_rate))
+            if use_residual and in_dim == hidden_dim:
+                layers.append(ResidualBlock(hidden_dim, act_cls, dropout_rate))
+            else:
+                layers.append(nn.Linear(in_dim, hidden_dim))
+                layers.append(act_cls())
+                if dropout_rate > 0.0:
+                    layers.append(nn.Dropout(dropout_rate))
             in_dim = hidden_dim
 
         layers.append(nn.Linear(in_dim, output_dim))
         self.net = nn.Sequential(*layers)
         self.input_dim = input_dim
         self.output_dim = output_dim
+        self.use_residual = use_residual
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.ndim == 2
@@ -50,7 +67,9 @@ class SurrogateMLP(nn.Module):
         return out
 
 
-def predict_mc_dropout(model: nn.Module, x: torch.Tensor, n_passes: int) -> tuple[torch.Tensor, torch.Tensor]:
+def predict_mc_dropout(
+    model: nn.Module, x: torch.Tensor, n_passes: int, batch_size: int = 16384
+) -> tuple[torch.Tensor, torch.Tensor]:
     assert n_passes > 1
     assert x.ndim == 2
 
@@ -59,10 +78,15 @@ def predict_mc_dropout(model: nn.Module, x: torch.Tensor, n_passes: int) -> tupl
         if isinstance(module, nn.Dropout):
             module.train()
 
-    use_amp = x.device.type == "cuda"
-    with torch.no_grad(), torch.amp.autocast(device_type=x.device.type, enabled=use_amp):
-        preds = torch.stack([model(x).float() for _ in range(n_passes)], dim=0)
+    means: list[torch.Tensor] = []
+    vars_: list[torch.Tensor] = []
+    with torch.no_grad():
+        for i in range(0, len(x), batch_size):
+            bx = x[i : i + batch_size]
+            preds = torch.stack([model(bx).float() for _ in range(n_passes)], dim=0)
+            means.append(preds.mean(dim=0))
+            vars_.append(preds.var(dim=0))
 
-    mean = preds.mean(dim=0)
-    var = preds.var(dim=0)
-    return mean, var
+    model.eval()
+    return torch.cat(means, dim=0), torch.cat(vars_, dim=0)
+

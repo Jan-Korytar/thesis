@@ -33,10 +33,13 @@ def _get_quad_nodes(n_quad: int, u_max: float, device: torch.device, dtype: torc
     return _LEGG_CACHE[key]
 
 
-def price_bates_call(x: torch.Tensor, n_quad: int = 128, chunk_size: int = 32768) -> torch.Tensor:
+def price_bates_call(
+    x: torch.Tensor, n_quad: int = 192, chunk_size: int = 32768, return_float64: bool = False
+) -> torch.Tensor:
     assert x.ndim == 2
     assert x.shape[1] == 13
-    return torch.cat([_price_bates_chunk(x[i : i + chunk_size], n_quad) for i in range(0, x.shape[0], chunk_size)])
+    out64 = torch.cat([_price_bates_chunk(x[i : i + chunk_size], n_quad) for i in range(0, x.shape[0], chunk_size)])
+    return out64 if return_float64 else out64.float()
 
 
 def _price_bates_chunk(x: torch.Tensor, n_quad: int) -> torch.Tensor:
@@ -58,7 +61,7 @@ def _price_bates_chunk(x: torch.Tensor, n_quad: int) -> torch.Tensor:
     nu2 = x[:, 11].to(dtype).unsqueeze(-1)
     prob = x[:, 12].to(dtype).unsqueeze(-1)
 
-    u_max = 80.0
+    u_max = 200.0
     nodes_t, weights_t = _get_quad_nodes(n_quad, u_max, device, dtype)
 
     k_over_s = torch.exp(-m_val)
@@ -96,7 +99,7 @@ def _price_bates_chunk(x: torch.Tensor, n_quad: int) -> torch.Tensor:
     )
     upper_bound = torch.exp(-q.squeeze(-1) * tau.squeeze(-1))
 
-    return torch.clamp(c_norm, min=lower_bound, max=upper_bound).float()
+    return torch.clamp(c_norm, min=lower_bound, max=upper_bound)
 
 
 def bs_call_price(m: torch.Tensor, tau: torch.Tensor, r: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
@@ -116,32 +119,55 @@ def invert_bsiv(
     tau: torch.Tensor,
     r: torch.Tensor,
     q: torch.Tensor,
-    max_iter: int = 20,
-    tol: float = 1e-5,
+    n_bisect: int = 28,
+    n_newton: int = 6,
 ) -> torch.Tensor:
-    k = torch.exp(-m)
-    lower = torch.clamp(torch.exp(-q * tau) - k * torch.exp(-r * tau), min=0.0)
-    upper = torch.exp(-q * tau)
-    valid = (price > lower + 1e-5) & (price < upper - 1e-5)
+    """Inverts Black-Scholes implied volatility in float64 using bracketed Bisection + safeguarded Newton-Raphson.
+    Because Black-Scholes price is strictly monotonic in sigma, bisection in float64 never diverges when Vega is tiny.
+    """
+    price64 = price.to(torch.float64)
+    m64 = m.to(torch.float64)
+    tau64 = tau.to(torch.float64)
+    r64 = r.to(torch.float64)
+    q64 = q.to(torch.float64)
 
-    sigma = torch.clamp(torch.sqrt(2.0 * np.pi / tau) * price, min=0.05, max=2.0)
-    sqrt_tau = torch.sqrt(tau)
+    k = torch.exp(-m64)
+    disc_q = torch.exp(-q64 * tau64)
+    disc_r = torch.exp(-r64 * tau64)
+    lower = torch.clamp(disc_q - k * disc_r, min=0.0)
+    upper = disc_q
+
+    # In float64, time value down to 1e-7 is numerically well-resolved
+    valid = (price64 > lower + 1e-7) & (price64 < upper - 1e-7)
+
+    low_sig = torch.full_like(price64, 0.005)
+    high_sig = torch.full_like(price64, 4.000)
+
+    # 1. Guaranteed bracketed bisection in float64 (2^-28 ~ 3.7e-9 bracket width)
+    for _ in range(n_bisect):
+        mid_sig = 0.5 * (low_sig + high_sig)
+        p_mid = bs_call_price(m64, tau64, r64, q64, mid_sig)
+        too_high = p_mid > price64
+        high_sig = torch.where(too_high, mid_sig, high_sig)
+        low_sig = torch.where(too_high, low_sig, mid_sig)
+
+    sigma = 0.5 * (low_sig + high_sig)
+    sqrt_tau = torch.sqrt(tau64)
     inv_sqrt_2pi = 1.0 / np.sqrt(2.0 * np.pi)
-    disc_q = torch.exp(-q * tau)
 
-    for _ in range(max_iter):
-        p_guess = bs_call_price(m, tau, r, q, sigma)
-        diff = p_guess - price
+    # 2. Safeguarded Newton-Raphson polish within [low_sig, high_sig]
+    for _ in range(n_newton):
+        p_guess = bs_call_price(m64, tau64, r64, q64, sigma)
+        diff = p_guess - price64
+        d1 = (m64 + (r64 - q64 + 0.5 * sigma**2) * tau64) / (sigma * sqrt_tau)
+        vega = disc_q * sqrt_tau * inv_sqrt_2pi * torch.exp(-0.5 * d1**2)
+        newton_step = torch.where(vega > 1e-12, sigma - diff / torch.clamp(vega, min=1e-12), sigma)
+        sigma = torch.clamp(newton_step, min=low_sig, max=high_sig)
 
-        d1 = (m + (r - q + 0.5 * sigma**2) * tau) / (sigma * sqrt_tau)
-        vega = torch.clamp(disc_q * sqrt_tau * inv_sqrt_2pi * torch.exp(-0.5 * d1**2), min=1e-8)
-
-        sigma = torch.clamp(sigma - diff / vega, min=0.001, max=5.0)
-
-    p_final = bs_call_price(m, tau, r, q, sigma)
-    converged = valid & (torch.abs(p_final - price) < 1e-3)
+    p_final = bs_call_price(m64, tau64, r64, q64, sigma)
+    converged = valid & (torch.abs(p_final - price64) < 1e-4)
     sigma[~converged] = float("nan")
-    return sigma
+    return sigma.float()
 
 
 def sample_parameters(
@@ -212,7 +238,7 @@ def generate_bates_bsiv_data(
         if cur_seed is not None:
             cur_seed += 1000
 
-        prices = price_bates_call(x_cand)
+        prices = price_bates_call(x_cand, return_float64=True)
         m = x_cand[:, 0]
         tau = x_cand[:, 1] / 365.0
         r = x_cand[:, 3]

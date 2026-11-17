@@ -58,8 +58,10 @@ def evaluate_batch_chunk(
 
     if compute_greeks:
         bc_true, bdelta_true, bgamma_true = compute_true_greeks(bx_test)
+        bc_true64 = price_bates_call(bx_test, return_float64=True)
     else:
-        bc_true = price_bates_call(bx_test).unsqueeze(1)
+        bc_true64 = price_bates_call(bx_test, return_float64=True)
+        bc_true = bc_true64.float().unsqueeze(1)
         bdelta_true = None
         bgamma_true = None
 
@@ -71,7 +73,7 @@ def evaluate_batch_chunk(
     br = bx_test[:, 3]
     bq = bx_test[:, 4]
 
-    bbsiv_true = invert_bsiv(bc_true.squeeze(-1), bm, btau, br, bq)
+    bbsiv_true = invert_bsiv(bc_true64, bm, btau, br, bq)
 
     price_ae = 0.0
     delta_ae = 0.0
@@ -148,7 +150,7 @@ def evaluate_hypercube_streaming(
         cur_seed += 1000
 
         if is_bsiv:
-            prices = price_bates_call(x_cand)
+            prices = price_bates_call(x_cand, return_float64=True)
             bsiv = invert_bsiv(prices, x_cand[:, 0], x_cand[:, 1] / 365.0, x_cand[:, 3], x_cand[:, 4])
             valid = torch.isfinite(bsiv) & (bsiv > 0.01) & (bsiv < 4.0)
             x_val = x_cand[valid]
@@ -256,7 +258,7 @@ def evaluate_chen_bin_streaming(
             continue
 
         x_val = x_cand[valid_m]
-        prices = price_bates_call(x_val)
+        prices = price_bates_call(x_val, return_float64=True)
         bsiv_true = invert_bsiv(prices, x_val[:, 0], x_val[:, 1] / 365.0, x_val[:, 3], x_val[:, 4])
         valid_iv = torch.isfinite(bsiv_true) & (bsiv_true > 0.01) & (bsiv_true < 4.0)
         if not valid_iv.any():

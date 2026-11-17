@@ -204,31 +204,6 @@ def build_optimizer(model: nn.Module, lr: float, weight_decay: float, device: to
     return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, fused=device.type == "cuda")
 
 
-def build_warm_restart_cosine_scheduler(
-    optimizer: torch.optim.Optimizer,
-    total_epochs: int,
-    base_lr: float,
-    min_lr: float,
-    n_restarts: int = 3,
-    restart_fraction: float = 0.5,
-) -> torch.optim.lr_scheduler.LambdaLR:
-    half_epochs = max(int(total_epochs * restart_fraction), 1)
-    cycle_len = max(half_epochs // n_restarts, 1)
-    min_ratio = min_lr / base_lr
-
-    def lr_lambda(epoch: int) -> float:
-        if epoch < half_epochs:
-            progress = (epoch % cycle_len) / cycle_len
-            cos_val = 0.5 * (1.0 + math.cos(math.pi * progress))
-        else:
-            remaining_total = max(total_epochs - half_epochs, 1)
-            progress = min(max((epoch - half_epochs) / remaining_total, 0.0), 1.0)
-            cos_val = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_ratio + (1.0 - min_ratio) * cos_val
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-
 def build_scheduler(
     optimizer: torch.optim.Optimizer,
     cfg: dict[str, Any],
@@ -236,7 +211,6 @@ def build_scheduler(
 ) -> torch.optim.lr_scheduler.LRScheduler:
     train_cfg = cfg["training"]
     sched_type = train_cfg.get("lr_scheduler", "cosine").lower()
-    base_lr = train_cfg["learning_rate"]
     min_lr = train_cfg["min_learning_rate"]
 
     if sched_type == "cosine":
@@ -253,17 +227,8 @@ def build_scheduler(
             step_size=step_size,
             gamma=gamma,
         )
-    elif sched_type == "warm_restarts":
-        return build_warm_restart_cosine_scheduler(
-            optimizer=optimizer,
-            total_epochs=total_epochs,
-            base_lr=base_lr,
-            min_lr=min_lr,
-            n_restarts=3,
-            restart_fraction=0.5,
-        )
     else:
-        raise ValueError(f"Unknown lr_scheduler '{sched_type}'. Valid options: cosine, step, warm_restarts")
+        raise ValueError(f"Unknown lr_scheduler '{sched_type}'. Valid options: cosine, step")
 
 
 def run_epoch(
@@ -277,7 +242,15 @@ def run_epoch(
     use_amp: bool = False,
 ) -> float:
     is_train = optimizer is not None
-    model.train() if is_train else model.eval()
+    if is_train:
+        model.train()
+        # Keep Dropout disabled during gradient updates to avoid multiplicative activation noise floor (~100 bps)
+        # in deterministic PDE/Fourier surrogate regression; Dropout is explicitly enabled only in MC-Dropout scoring.
+        for module in model.modules():
+            if isinstance(module, nn.Dropout):
+                module.eval()
+    else:
+        model.eval()
 
     total_loss = torch.zeros((), device=device)
     total_samples = 0
@@ -459,7 +432,11 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
     patience_counter = 0
 
     for r in range(1, rounds + 1):
-        x_pool_raw = sample_parameters(bounds, pool_size, seed=cfg["seed"] + 100 * r, device=device)
+        if is_bsiv:
+            x_pool_raw, y_pool = generate_bates_bsiv_data(bounds, pool_size, seed=cfg["seed"] + 10000 * r, device=device)
+        else:
+            x_pool_raw = sample_parameters(bounds, pool_size, seed=cfg["seed"] + 10000 * r, device=device)
+            y_pool = None
         x_pool_norm = normalize_features(x_pool_raw, bounds)
 
         top_indices, mean_uncert, mean_aux = select_active_samples(
@@ -477,15 +454,8 @@ def train_active(cfg: dict[str, Any]) -> nn.Module:
         x_acquired_raw = x_pool_raw[top_indices]
 
         if is_bsiv:
-            prices = price_bates_call(x_acquired_raw)
-            m = x_acquired_raw[:, 0]
-            tau = x_acquired_raw[:, 1] / 365.0
-            r_rate = x_acquired_raw[:, 3]
-            q_div = x_acquired_raw[:, 4]
-            bsiv_acquired = invert_bsiv(prices, m, tau, r_rate, q_div).unsqueeze(1)
-            valid = torch.isfinite(bsiv_acquired.squeeze(1)) & (bsiv_acquired.squeeze(1) > 0.01) & (bsiv_acquired.squeeze(1) < 4.0)
-            x_acquired_raw = x_acquired_raw[valid]
-            y_acquired = bsiv_acquired[valid]
+            assert y_pool is not None
+            y_acquired = y_pool[top_indices]
         else:
             y_acquired = price_bates_call(x_acquired_raw).unsqueeze(1)
 

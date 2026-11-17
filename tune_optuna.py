@@ -91,7 +91,7 @@ def suggest_stage1(trial: optuna.Trial) -> dict[str, Any]:
         "width": trial.suggest_categorical("width", [256, 384, 512, 768, 1024]),
         "activation": trial.suggest_categorical("activation", ["silu", "gelu", "selu", "tanh"]),
         "dropout_rate": trial.suggest_float("dropout_rate", 0.01, 0.04, step=0.01),
-        "lr_scheduler": trial.suggest_categorical("lr_scheduler", ["cosine", "step", "warm_restarts"]),
+        "lr_scheduler": trial.suggest_categorical("lr_scheduler", ["cosine", "step"]),
         "learning_rate": trial.suggest_float("learning_rate", 1e-4, 6e-4, log=True),
         "weight_decay": trial.suggest_categorical("weight_decay", [0.0, 1e-7, 1e-6, 1e-5]),
         "batch_size": trial.suggest_categorical("batch_size", [256, 512, 1024]),
